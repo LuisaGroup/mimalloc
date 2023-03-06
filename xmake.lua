@@ -4,8 +4,6 @@ _config_project({
 	project_kind = "shared",
 	no_rtti = true
 })
-local add_includedirs = _get_add_includedirs()
-local add_defines = _get_add_defines()
 add_includedirs("include", {
 	public = true
 })
