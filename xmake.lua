@@ -1,6 +1,6 @@
 includes("build_proj.lua")
+target("mimalloc")
 _config_project({
-	project_name = "mimalloc",
 	project_kind = "shared",
 	no_rtti = true
 })
