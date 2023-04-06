@@ -20,3 +20,4 @@ elseif is_plat("linux") then
 else
 	add_syslinks("pthread")
 end
+target_end()
