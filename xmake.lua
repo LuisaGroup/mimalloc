@@ -4,20 +4,25 @@ _config_project({
 	project_kind = "shared",
 	no_rtti = true
 })
-add_includedirs("include", {
-	public = true
-})
-add_defines("MI_SHARED_LIB", {
-	public = true
-})
-add_defines("MI_SHARED_LIB_EXPORT", "MI_XMALLOC=1", "MI_WIN_NOREDIRECT")
+on_load(function(target)
+	local function rela(p)
+		return path.relative(path.absolute(p, os.scriptdir()), os.projectdir())
+	end
+	target:add("includedirs", rela("include"), {
+		public = true
+	})
+	target:add("defines", "MI_SHARED_LIB", {
+		public = true
+	})
+	target:add("defines", "MI_SHARED_LIB_EXPORT", "MI_XMALLOC=1", "MI_WIN_NOREDIRECT")
+	if is_plat("windows") then
+		target:add("syslinks","psapi", "shell32", "user32", "advapi32", "bcrypt")
+		target:add("defines", "_CRT_SECURE_NO_WARNINGS")
+	elseif is_plat("linux") then
+		target:add("syslinks","pthread", "atomic")
+	else
+		target:add("syslinks","pthread")
+	end
+end)
 add_files("src/static.c")
-if is_plat("windows") then
-	add_syslinks("psapi", "shell32", "user32", "advapi32", "bcrypt")
-	add_defines("_CRT_SECURE_NO_WARNINGS")
-elseif is_plat("linux") then
-	add_syslinks("pthread", "atomic")
-else
-	add_syslinks("pthread")
-end
 target_end()
