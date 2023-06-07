@@ -24,5 +24,6 @@ on_load(function(target)
 		target:add("syslinks","pthread")
 	end
 end)
+add_headerfiles("include/*.h")
 add_files("src/static.c")
 target_end()
