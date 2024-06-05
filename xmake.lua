@@ -13,7 +13,7 @@ on_load(function(target)
 	})
 	target:add("defines", "MI_XMALLOC=1", "MI_WIN_NOREDIRECT")
 	if is_plat("windows") then
-		target:add("syslinks","psapi", "shell32", "user32", "advapi32", "bcrypt", {public = true})
+		target:add("syslinks","advapi32", "bcrypt", {public = true})
 		target:add("defines", "_CRT_SECURE_NO_WARNINGS")
 	elseif is_plat("linux") then
 		target:add("syslinks","pthread", "atomic", {public = true})
