@@ -1,7 +1,7 @@
 includes("build_proj.lua")
 target("mimalloc")
 _config_project({
-	project_kind = "static",
+	project_kind = "object",
 	no_rtti = true
 })
 on_load(function(target)
