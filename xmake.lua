@@ -11,7 +11,8 @@ on_load(function(target)
 	target:add("includedirs", rela("include"), {
 		public = true
 	})
-	target:add("defines", "MI_XMALLOC=1", "MI_WIN_NOREDIRECT")
+	target:add("defines", "MI_SHARED_LIB", {public = true})
+	target:add("defines", "MI_XMALLOC=1", "MI_WIN_NOREDIRECT", "MI_SHARED_LIB_EXPORT")
 	if is_plat("windows") then
 		target:add("syslinks","advapi32", "bcrypt", {public = true})
 		target:add("defines", "_CRT_SECURE_NO_WARNINGS")
