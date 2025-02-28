@@ -57,7 +57,7 @@ terms of the MIT license. A copy of the license can be found in the file
   #include <sys/sysctl.h>
 #endif
 
-#if defined(__linux__) || defined(__FreeBSD__)
+#if (defined(__linux__) && !defined(__ANDROID__)) || defined(__FreeBSD__)
   #define MI_HAS_SYSCALL_H
   #include <sys/syscall.h>
 #endif
@@ -142,8 +142,9 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config )
     config->alloc_granularity = (size_t)psize;
     #if defined(_SC_PHYS_PAGES)
     long pphys = sysconf(_SC_PHYS_PAGES);
-    if (pphys > 0 && (size_t)pphys < (SIZE_MAX/(size_t)psize)) {
-      config->physical_memory = (size_t)pphys * (size_t)psize;
+    const size_t psize_in_kib = (size_t)psize / MI_KiB;
+    if (psize_in_kib > 0 && pphys > 0 && (size_t)pphys <= (SIZE_MAX/psize_in_kib)) {
+      config->physical_memory_in_kib = (size_t)pphys * psize_in_kib;
     }
     #endif
   }
