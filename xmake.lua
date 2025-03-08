@@ -39,5 +39,5 @@ on_load(function(target)
 	end
 end)
 add_headerfiles("include/*.h")
-add_files("src/static.c")
+add_files("src/static.cpp")
 target_end()
