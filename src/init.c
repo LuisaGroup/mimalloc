@@ -66,29 +66,25 @@ const mi_page_t _mi_page_empty = {
     QNULL(MI_LARGE_OBJ_WSIZE_MAX + 1  /* 655360, Huge queue */), \
     QNULL(MI_LARGE_OBJ_WSIZE_MAX + 2) /* Full queue */ }
 
-#define MI_STAT_COUNT_NULL()  {0,0,0,0}
+#define MI_STAT_COUNT_NULL()  {0,0,0}
 
 // Empty statistics
-#if MI_STAT>1
-#define MI_STAT_COUNT_END_NULL()  , { MI_STAT_COUNT_NULL(), MI_INIT32(MI_STAT_COUNT_NULL) }
-#else
-#define MI_STAT_COUNT_END_NULL()
-#endif
-
 #define MI_STATS_NULL  \
-  MI_STAT_COUNT_NULL(), MI_STAT_COUNT_NULL(), \
-  MI_STAT_COUNT_NULL(), MI_STAT_COUNT_NULL(), \
-  MI_STAT_COUNT_NULL(), MI_STAT_COUNT_NULL(), \
-  MI_STAT_COUNT_NULL(), MI_STAT_COUNT_NULL(), \
-  MI_STAT_COUNT_NULL(), MI_STAT_COUNT_NULL(), \
-  MI_STAT_COUNT_NULL(), MI_STAT_COUNT_NULL(), \
-  MI_STAT_COUNT_NULL(), MI_STAT_COUNT_NULL(), \
-  MI_STAT_COUNT_NULL(), \
-  { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, \
-  { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, \
-  { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, \
-  { 0, 0 } \
-  MI_STAT_COUNT_END_NULL()
+  MI_STAT_COUNT_NULL(), MI_STAT_COUNT_NULL(), MI_STAT_COUNT_NULL(), MI_STAT_COUNT_NULL(), \
+  MI_STAT_COUNT_NULL(), MI_STAT_COUNT_NULL(), MI_STAT_COUNT_NULL(), MI_STAT_COUNT_NULL(), \
+  MI_STAT_COUNT_NULL(), MI_STAT_COUNT_NULL(), MI_STAT_COUNT_NULL(), \
+  { 0 }, { 0 }, { 0 }, { 0 }, \
+  { 0 }, { 0 }, { 0 }, { 0 }, \
+  \
+  { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, \
+  MI_INIT4(MI_STAT_COUNT_NULL), \
+  { 0 }, { 0 }, { 0 }, { 0 },  \
+  \
+  { MI_INIT4(MI_STAT_COUNT_NULL) }, \
+  { { 0 }, { 0 }, { 0 }, { 0 } }, \
+  \
+  { MI_INIT74(MI_STAT_COUNT_NULL) }, \
+  { MI_INIT74(MI_STAT_COUNT_NULL) }
 
 // --------------------------------------------------------
 // Statically allocate an empty heap as the initial
@@ -109,6 +105,7 @@ mi_decl_hidden mi_decl_cache_align const mi_heap_t _mi_heap_empty = {
   { {0}, {0}, 0, true }, // random
   0,                // page count
   MI_BIN_FULL, 0,   // page retired min/max
+  0, 0,             // generic count
   NULL,             // next
   false,            // can reclaim
   0,                // tag
@@ -138,7 +135,7 @@ static mi_decl_cache_align mi_tld_t tld_main = {
     0, 0, 0, 0, 0, &mi_subproc_default,
     &tld_main.stats
   }, // segments
-  { MI_STATS_NULL }       // stats
+  { MI_STAT_VERSION, MI_STATS_NULL }       // stats
 };
 
 mi_decl_cache_align mi_heap_t _mi_heap_main = {
@@ -151,6 +148,7 @@ mi_decl_cache_align mi_heap_t _mi_heap_main = {
   { {0x846ca68b}, {0}, 0, true },  // random
   0,                // page count
   MI_BIN_FULL, 0,   // page retired min/max
+  0, 0,             // generic count
   NULL,             // next heap
   false,            // can reclaim
   0,                // tag
@@ -163,7 +161,7 @@ mi_decl_cache_align mi_heap_t _mi_heap_main = {
 
 bool _mi_process_is_initialized = false;  // set to `true` in `mi_process_init`.
 
-mi_stats_t _mi_stats_main = { MI_STATS_NULL };
+mi_stats_t _mi_stats_main = { MI_STAT_VERSION, MI_STATS_NULL };
 
 #if MI_GUARDED
 mi_decl_export void mi_heap_guarded_set_sample_rate(mi_heap_t* heap, size_t sample_rate, size_t seed) {
@@ -602,7 +600,7 @@ static void mi_detect_cpu_features(void) {
   int32_t cpu_info[4];
   __cpuid(cpu_info, 7);
   _mi_cpu_has_fsrm = ((cpu_info[3] & (1 << 4)) != 0); // bit 4 of EDX : see <https://en.wikipedia.org/wiki/CPUID#EAX=7,_ECX=0:_Extended_Features>
-  _mi_cpu_has_erms = ((cpu_info[2] & (1 << 9)) != 0); // bit 9 of ECX : see <https://en.wikipedia.org/wiki/CPUID#EAX=7,_ECX=0:_Extended_Features>
+  _mi_cpu_has_erms = ((cpu_info[1] & (1 << 9)) != 0); // bit 9 of EBX : see <https://en.wikipedia.org/wiki/CPUID#EAX=7,_ECX=0:_Extended_Features>
 }
 #else
 static void mi_detect_cpu_features(void) {
@@ -625,14 +623,6 @@ void mi_process_init(void) mi_attr_noexcept {
   mi_detect_cpu_features();
   _mi_os_init();
   mi_heap_main_init();
-  #if MI_DEBUG
-  _mi_verbose_message("debug level : %d\n", MI_DEBUG);
-  #endif
-  _mi_verbose_message("secure level: %d\n", MI_SECURE);
-  _mi_verbose_message("mem tracking: %s\n", MI_TRACK_TOOL);
-  #if MI_TSAN
-  _mi_verbose_message("thread santizer enabled\n");
-  #endif
   mi_thread_init();
 
   #if defined(_WIN32)

@@ -83,11 +83,11 @@ extern inline void* _mi_page_malloc_zero(mi_heap_t* heap, mi_page_t* page, size_
   #if (MI_STAT>0)
   const size_t bsize = mi_page_usable_block_size(page);
   if (bsize <= MI_LARGE_OBJ_SIZE_MAX) {
-    mi_heap_stat_increase(heap, normal, bsize);
-    mi_heap_stat_counter_increase(heap, normal_count, 1);
+    mi_heap_stat_increase(heap, malloc_normal, bsize);
+    mi_heap_stat_counter_increase(heap, malloc_normal_count, 1);
     #if (MI_STAT>1)
     const size_t bin = _mi_bin(bsize);
-    mi_heap_stat_increase(heap, normal_bins[bin], 1);
+    mi_heap_stat_increase(heap, malloc_bins[bin], 1);
     #endif
   }
   #endif
@@ -149,7 +149,7 @@ static inline mi_decl_restrict void* mi_heap_malloc_small_zero(mi_heap_t* heap, 
   #if MI_STAT>1
   if (p != NULL) {
     if (!mi_heap_is_initialized(heap)) { heap = mi_prim_get_default_heap(); }
-    mi_heap_stat_increase(heap, malloc, mi_usable_size(p));
+    mi_heap_stat_increase(heap, malloc_requested, mi_usable_size(p));
   }
   #endif
   #if MI_DEBUG>3
@@ -191,7 +191,7 @@ extern inline void* _mi_heap_malloc_zero_ex(mi_heap_t* heap, size_t size, bool z
     #if MI_STAT>1
     if (p != NULL) {
       if (!mi_heap_is_initialized(heap)) { heap = mi_prim_get_default_heap(); }
-      mi_heap_stat_increase(heap, malloc, mi_usable_size(p));
+      mi_heap_stat_increase(heap, malloc_requested, mi_usable_size(p));
     }
     #endif
     #if MI_DEBUG>3
@@ -666,9 +666,9 @@ mi_decl_restrict void* _mi_heap_malloc_guarded(mi_heap_t* heap, size_t size, boo
   if (p != NULL) {
     if (!mi_heap_is_initialized(heap)) { heap = mi_prim_get_default_heap(); }
     #if MI_STAT>1
-    mi_heap_stat_increase(heap, malloc, mi_usable_size(p));
+    mi_heap_stat_increase(heap, malloc_requested, mi_usable_size(p));
     #endif
-    _mi_stat_counter_increase(&heap->tld->stats.guarded_alloc_count, 1);
+    _mi_stat_counter_increase(&heap->tld->stats.malloc_guarded_count, 1);
   }
   #if MI_DEBUG>3
   if (p != NULL && zero) {

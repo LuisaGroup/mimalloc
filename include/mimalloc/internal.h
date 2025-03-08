@@ -77,6 +77,7 @@ bool        _mi_getenv(const char* name, char* result, size_t result_size);
 // "options.c"
 void        _mi_fputs(mi_output_fun* out, void* arg, const char* prefix, const char* message);
 void        _mi_fprintf(mi_output_fun* out, void* arg, const char* fmt, ...);
+void        _mi_message(const char* fmt, ...);
 void        _mi_warning_message(const char* fmt, ...);
 void        _mi_verbose_message(const char* fmt, ...);
 void        _mi_trace_message(const char* fmt, ...);
@@ -311,7 +312,7 @@ bool        _mi_page_is_valid(mi_page_t* page);
 #define MI_INIT64(x)  MI_INIT32(x),MI_INIT32(x)
 #define MI_INIT128(x) MI_INIT64(x),MI_INIT64(x)
 #define MI_INIT256(x) MI_INIT128(x),MI_INIT128(x)
-
+#define MI_INIT74(x)  MI_INIT64(x),MI_INIT8(x),x(),x()
 
 #include <string.h>
 // initialize a local variable to zero; use memset as compilers optimize constant sized memset's
