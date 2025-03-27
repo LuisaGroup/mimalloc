@@ -271,6 +271,14 @@ static inline int64_t mi_atomic_addi64_relaxed(volatile _Atomic(int64_t)*p, int6
   return current;
 #endif
 }
+
+static inline void mi_atomic_void_addi64_relaxed(volatile int64_t* p, const volatile int64_t* padd) {
+  const int64_t add = *padd;
+  if (add != 0) {
+    mi_atomic_addi64_relaxed((volatile _Atomic(int64_t)*)p, add);
+  }
+}
+
 static inline void mi_atomic_maxi64_relaxed(volatile _Atomic(int64_t)*p, int64_t x) {
   int64_t current;
   do {
@@ -378,7 +386,7 @@ static inline void mi_atomic_yield(void) {
 static inline void mi_atomic_yield(void) {
   __asm__ volatile("wfe");
 }
-#elif (defined(__arm__) && __ARM_ARCH__ >= 7)
+#elif (defined(__arm__) && __ARM_ARCH >= 7)
 static inline void mi_atomic_yield(void) {
   __asm__ volatile("yield" ::: "memory");
 }
