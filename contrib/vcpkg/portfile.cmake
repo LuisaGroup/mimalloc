@@ -3,13 +3,13 @@ vcpkg_from_github(
   REPO microsoft/mimalloc
   HEAD_REF master
 
-  # The "REF" can be a commit hash, branch name (dev2), or a version (v2.2.1).
-  # REF "v${VERSION}"
-  REF 6a89f8554eaab8d8d00e17b5b09f79e1d8dbf61b
-
+  # The `REF` can be a commit hash, branch name (`dev3`), or a version (`v3.1.4`).
+  # Use `"v${VERSION}"` to use the version specified in `vcpkg.json`.
+  REF "v${VERSION}"
+  
   # The sha512 is the hash of the tar.gz bundle.
-  # (To get the sha512, run `vcpkg install mimalloc[override] --overlay-ports=<dir of this file>` and copy the sha from the error message.)
-  SHA512 32b87a3195efcc558b83a546348a8fb544fed335cdd6c9f8e7e9d0e8e64540fdcf1f4aa57fd0e783b78731518f4810292b832227d7e7665bf8426f1e6ce96f9d
+  # (To get the sha512, run `vcpkg install "mimalloc[override]" --overlay-ports=./contrib/vcpkg` and copy the sha from the error message.)
+  SHA512 616351e549707318c1f8b164251141684a73d5bf8205b905736f48ab21fbb19bfaa4d52c4e63642fcb144345b6a5331944b6c8e0827925000553e46f2c2c31e9
 )
 
 vcpkg_check_features(OUT_FEATURE_OPTIONS FEATURE_OPTIONS
@@ -19,6 +19,7 @@ vcpkg_check_features(OUT_FEATURE_OPTIONS FEATURE_OPTIONS
     secure      MI_SECURE
     override    MI_OVERRIDE
     optarch     MI_OPT_ARCH
+    nooptarch   MI_NO_OPT_ARCH
     optsimd     MI_OPT_SIMD
     xmalloc     MI_XMALLOC
     asm         MI_SEE_ASM
