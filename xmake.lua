@@ -34,10 +34,11 @@ on_load(function(target)
 		target:add("defines", "_CRT_SECURE_NO_WARNINGS")
 	elseif is_plat("linux") then
 		target:add("syslinks","pthread", "atomic", {public = true})
+		target:add("defines", "MI_NO_THP")
 	else
 		target:add("syslinks","pthread", {public = true})
 	end
 end)
 add_headerfiles("include/*.h")
-add_files("src/build.mimalloc.cpp")
+add_files("src/static.c")
 target_end()
