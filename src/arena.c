@@ -211,7 +211,7 @@ static mi_decl_noinline void* mi_arena_try_alloc_at(
       #if MI_DEBUG > 1
       if (memid->initially_zero) {
         if (!mi_mem_is_zero(p, mi_size_of_slices(slice_count))) {
-          _mi_error_message(EFAULT, "interal error: arena allocation was not zero-initialized!\n");
+          _mi_error_message(EFAULT, "internal error: arena allocation was not zero-initialized!\n");
           memid->initially_zero = false;
         }
       }
@@ -285,6 +285,11 @@ static bool mi_arena_reserve(mi_subproc_t* subproc, size_t req_size, bool allow_
     }
   }
 
+  // try to accommodate the requested size for huge allocations
+  if (arena_reserve < req_size) {
+    arena_reserve = _mi_align_up(req_size + MI_ARENA_MAX_CHUNK_OBJ_SIZE, MI_ARENA_MAX_CHUNK_OBJ_SIZE); // over-reserve for meta-info
+  }
+
   // check arena bounds
   const size_t min_reserve = MI_ARENA_MIN_SIZE;
   const size_t max_reserve = MI_ARENA_MAX_SIZE;   // 16 GiB
@@ -295,7 +300,8 @@ static bool mi_arena_reserve(mi_subproc_t* subproc, size_t req_size, bool allow_
     arena_reserve = max_reserve;
   }
 
-  if (arena_reserve < req_size) return false;  // should be able to at least handle the current allocation size
+  // should be able to at least handle the current allocation size
+  if (arena_reserve < req_size) return false;  
 
   // commit eagerly?
   bool arena_commit = false;
@@ -311,13 +317,13 @@ static bool mi_arena_reserve(mi_subproc_t* subproc, size_t req_size, bool allow_
   int err = mi_reserve_os_memory_ex2(subproc, arena_reserve, arena_commit, allow_large, false /* exclusive? */, arena_id);
   if (err != 0) {
     if (adjust) { mi_subproc_stat_adjust_increase( subproc, committed, arena_reserve); } // roll back
-    // failed, try a smaller size?
-    const size_t small_arena_reserve = (MI_SIZE_BITS == 32 ? 128*MI_MiB : 1*MI_GiB);
-    if (adjust) { mi_subproc_stat_adjust_decrease( subproc, committed, arena_reserve); }
-    if (arena_reserve > small_arena_reserve) {
+    // failed to allocate: try a smaller size arena as fallback?
+    const size_t small_arena_reserve = 4 * MI_ARENA_MIN_SIZE; // 128 MiB (or 32 MiB on 32-bit)
+    if (arena_reserve > small_arena_reserve && small_arena_reserve > req_size) {
       // try again
-      err = mi_reserve_os_memory_ex(small_arena_reserve, arena_commit, allow_large, false /* exclusive? */, arena_id);
-      if (err != 0 && adjust) { mi_subproc_stat_adjust_increase( subproc, committed, arena_reserve); } // roll back
+      if (adjust) { mi_subproc_stat_adjust_decrease(subproc, committed, small_arena_reserve); }
+      err = mi_reserve_os_memory_ex2(subproc, small_arena_reserve, arena_commit, allow_large, false /* exclusive? */, arena_id);
+      if (err != 0 && adjust) { mi_subproc_stat_adjust_increase( subproc, committed, small_arena_reserve); } // roll back
     }
   }
   return (err==0);
@@ -388,7 +394,7 @@ static mi_decl_noinline void* mi_arenas_try_find_free(
   mi_subproc_t* subproc, size_t slice_count, size_t alignment,
   bool commit, bool allow_large, mi_arena_t* req_arena, size_t tseq, int numa_node, mi_memid_t* memid)
 {
-  mi_assert_internal(slice_count <= mi_slice_count_of_size(MI_ARENA_MAX_OBJ_SIZE));
+  // mi_assert_internal(slice_count <= mi_slice_count_of_size(MI_ARENA_MAX_CHUNK_OBJ_SIZE));
   mi_assert(alignment <= MI_ARENA_SLICE_ALIGN);
   if (alignment > MI_ARENA_SLICE_ALIGN) return NULL;
 
@@ -418,9 +424,12 @@ static mi_decl_noinline void* mi_arenas_try_alloc(
   bool commit, bool allow_large,
   mi_arena_t* req_arena, size_t tseq, int numa_node, mi_memid_t* memid)
 {
-  mi_assert(slice_count <= MI_ARENA_MAX_OBJ_SLICES);
+  // mi_assert(slice_count <= MI_ARENA_MAX_CHUNK_OBJ_SLICES);
   mi_assert(alignment <= MI_ARENA_SLICE_ALIGN);
   void* p;
+
+  // not too large?
+  if (slice_count * MI_ARENA_SLICE_SIZE > MI_ARENA_MAX_SIZE) return NULL;
 
   // try to find free slices in the arena's
   p = mi_arenas_try_find_free(subproc, slice_count, alignment, commit, allow_large, req_arena, tseq, numa_node, memid);
@@ -484,7 +493,7 @@ void* _mi_arenas_alloc_aligned( mi_subproc_t* subproc,
 
   // try to allocate in an arena if the alignment is small enough and the object is not too small (as for heap meta data)
   if (!mi_option_is_enabled(mi_option_disallow_arena_alloc) &&           // is arena allocation allowed?
-      size >= MI_ARENA_MIN_OBJ_SIZE && size <= MI_ARENA_MAX_OBJ_SIZE &&  // and not too small/large
+      size >= MI_ARENA_MIN_OBJ_SIZE && size <= MI_ARENA_MAX_OBJ_SIZE &&               // and not too small or too large
       alignment <= MI_ARENA_SLICE_ALIGN && align_offset == 0)            // and good alignment
   {
     const size_t slice_count = mi_slice_count_of_size(size);
@@ -596,9 +605,9 @@ static mi_page_t* mi_arenas_page_alloc_fresh(size_t slice_count, size_t block_si
   mi_memid_t memid = _mi_memid_none();
   mi_page_t* page = NULL;
   const size_t alloc_size = mi_size_of_slices(slice_count);
-  if (!mi_option_is_enabled(mi_option_disallow_arena_alloc) && // allowed to allocate from arena's?
-      !os_align &&                            // not large alignment
-      slice_count <= MI_ARENA_MAX_OBJ_SLICES) // and not too large
+  if (!mi_option_is_enabled(mi_option_disallow_arena_alloc) &&      // allowed to allocate from arena's?
+      !os_align &&                                                  // not large alignment
+      slice_count <= (MI_ARENA_MAX_OBJ_SIZE / MI_ARENA_SLICE_SIZE)) // and not too large
   {
     page = (mi_page_t*)mi_arenas_try_alloc(tld->subproc, slice_count, page_alignment, commit, allow_large, req_arena, tld->thread_seq, numa_node, &memid);
     if (page != NULL) {
@@ -794,6 +803,9 @@ mi_page_t* _mi_arenas_page_alloc(mi_heap_t* heap, size_t block_size, size_t bloc
   #endif
   else {
     page = mi_arenas_page_singleton_alloc(heap, block_size, block_alignment);
+  }
+  if mi_unlikely(page == NULL) {
+    return NULL;
   }
   // mi_assert_internal(page == NULL || _mi_page_segment(page)->subproc == tld->subproc);
   mi_assert_internal(_mi_is_aligned(page, MI_PAGE_ALIGN));
@@ -1205,8 +1217,8 @@ static bool mi_manage_os_memory_ex2(mi_subproc_t* subproc, void* start, size_t s
     _mi_warning_message("cannot use OS memory since it is not large enough (size %zu KiB, minimum required is %zu KiB)", size/MI_KiB, mi_size_of_slices(info_slices+1)/MI_KiB);
     return false;
   }
-  else if (info_slices >= MI_ARENA_MAX_OBJ_SLICES) {
-    _mi_warning_message("cannot use OS memory since it is too large with respect to the maximum object size (size %zu MiB, meta-info slices %zu, maximum object slices are %zu)", size/MI_MiB, info_slices, MI_ARENA_MAX_OBJ_SLICES);
+  else if (info_slices >= MI_ARENA_MAX_CHUNK_OBJ_SLICES) {
+    _mi_warning_message("cannot use OS memory since it is too large with respect to the maximum object size (size %zu MiB, meta-info slices %zu, maximum object slices are %zu)", size/MI_MiB, info_slices, MI_ARENA_MAX_CHUNK_OBJ_SLICES);
     return false;
   }
 
@@ -1453,6 +1465,8 @@ static size_t mi_debug_show_chunks(const char* header1, const char* header2, con
   const size_t used_slice_count = mi_arena_used_slices(arena);
   size_t bit_count = 0;
   size_t bit_set_count = 0;
+  long bit_of_page = 0;
+  mi_ansi_color_t color_of_page = MI_GRAY;
   for (size_t i = 0; i < chunk_count && bit_count < slice_count; i++) {
     char buf[5*MI_BCHUNK_BITS + 64]; _mi_memzero(buf, sizeof(buf));
     if (bit_count > used_slice_count && i+2 < chunk_count) {
@@ -1475,6 +1489,7 @@ static size_t mi_debug_show_chunks(const char* header1, const char* header2, con
         case MI_CBIN_SMALL:  chunk_kind = 'S'; break;
         case MI_CBIN_MEDIUM: chunk_kind = 'M'; break;
         case MI_CBIN_LARGE:  chunk_kind = 'L'; break;
+        case MI_CBIN_HUGE:   chunk_kind = 'H'; break;
         case MI_CBIN_OTHER:  chunk_kind = 'X'; break;
         default: chunk_kind = ' '; break; // suppress warning
         // case MI_CBIN_NONE: chunk_kind = 'N'; break;
@@ -1483,8 +1498,6 @@ static size_t mi_debug_show_chunks(const char* header1, const char* header2, con
     buf[k++] = chunk_kind;
     buf[k++] = ' ';
 
-    long bit_of_page = 0;
-    mi_ansi_color_t color_of_page = MI_GRAY;
     for (size_t j = 0; j < MI_BCHUNK_FIELDS; j++) {
       if (j > 0 && (j % fields_per_line) == 0) {
         // buf[k++] = '\n'; _mi_memset(buf+k,' ',7); k += 7;
@@ -1709,7 +1722,8 @@ typedef struct mi_purge_visit_info_s {
 } mi_purge_visit_info_t;
 
 static bool mi_arena_try_purge_range(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
-  if (mi_bbitmap_try_clearN(arena->slices_free, slice_index, slice_count)) {
+  mi_assert(slice_count < MI_BCHUNK_BITS);
+  if (mi_bbitmap_try_clearNC(arena->slices_free, slice_index, slice_count)) {
     // purge
     bool decommitted = mi_arena_purge(arena, slice_index, slice_count); MI_UNUSED(decommitted);
     mi_assert_internal(!decommitted || mi_bitmap_is_clearN(arena->slices_committed, slice_index, slice_count));
