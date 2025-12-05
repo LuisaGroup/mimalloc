@@ -192,16 +192,62 @@ void mi_free(void* p) mi_attr_noexcept
 }
 
 
-// ------------------------------------------------------
-// `mi_free_try_collect_mt`: Potentially collect a page
-// in a free in an abandoned page. 
+// --------------------------------------------------------------------------------------------
+// `mi_free_try_collect_mt`: Potentially collect a page in a free in an abandoned page. 
 // 1. if the page becomes empty, free it
 // 2. if it can be reclaimed, reclaim it in our heap
-// 3. if it went to < 7/8th used, re-abandon to be mapped 
-//    (so it can be found by heaps looking for free pages)
-// ------------------------------------------------------
+// 3. if it went to < 7/8th used, re-abandon to be mapped (so it can be found by heaps looking for free pages)
+// --------------------------------------------------------------------------------------------
 
-static bool mi_page_unown_from_free(mi_page_t* page, mi_block_t* mt_free);
+// Helper for mi_free_try_collect_mt: free if the page has no more used blocks (this is updated by `_mi_page_free_collect(_partly)`)  
+static bool mi_abandoned_page_try_free(mi_page_t* page) 
+{
+  if (!mi_page_all_free(page)) return false;
+  // first remove it from the abandoned pages in the arena (if mapped, this might wait for any readers to finish)  
+  _mi_arenas_page_unabandon(page); 
+  _mi_arenas_page_free(page,NULL); // we can now free the page directly
+  return true;  
+}
+
+// Helper for mi_free_try_collect_mt: try if we can reabandon a previously abandoned mostly full page to be mapped
+static bool mi_abandoned_page_try_reabandon_to_mapped(mi_page_t* page) 
+{
+  // if the page is unmapped, try to reabandon so it can possibly be mapped and found for allocations
+  // We only reabandon if a full page starts to have enough blocks available to prevent immediate re-abandon of a full page
+  if (mi_page_is_mostly_used(page)) return false;   // not too full
+  if (page->memid.memkind != MI_MEM_ARENA || mi_page_is_abandoned_mapped(page)) return false;  // and not already mapped (or unmappable)
+  
+  mi_assert(!mi_page_is_full(page));
+  return _mi_arenas_page_try_reabandon_to_mapped(page);
+}
+
+// Release ownership of a page. This may free or reabandond the page if other blocks are concurrently
+// freed in the meantime. Returns `true` if the page was freed.
+// By passing the captured `mt_free`, we can often avoid calling `mi_page_free_collect`.
+static void mi_abandoned_page_unown_from_free(mi_page_t* page, mi_block_t* mt_free) {
+  mi_assert_internal(mi_page_is_owned(page));
+  mi_assert_internal(mi_page_is_abandoned(page));
+  mi_assert_internal(mt_free != NULL);
+  mi_assert_internal(!mi_page_all_free(page));
+  // try to cas atomically the original free list (`mt_free`) back with the ownership cleared.
+  mi_thread_free_t tf_expect = mi_tf_create(mt_free, true);
+  mi_thread_free_t tf_new    = mi_tf_create(mt_free, false);
+  while mi_unlikely(!mi_atomic_cas_weak_acq_rel(&page->xthread_free, &tf_expect, tf_new)) {
+    mi_assert_internal(mi_tf_is_owned(tf_expect));
+    // while the xthread_free list is not empty..
+    while (mi_tf_block(tf_expect) != NULL) {
+      // if there were concurrent updates to the thread-free list, we retry to free or reabandon to mapped (if it became !mosty_used).
+      _mi_page_free_collect(page,false);  // update used count 
+      if (mi_abandoned_page_try_free(page)) return;
+      if (mi_abandoned_page_try_reabandon_to_mapped(page)) return;
+      // otherwise continue un-owning
+      tf_expect = mi_atomic_load_relaxed(&page->xthread_free);
+    }
+    // and try again to release ownership
+    mi_assert_internal(mi_tf_block(tf_expect)==NULL);
+    tf_new = mi_tf_create(NULL, false);
+  }
+}
 
 static inline bool mi_page_queue_len_is_atmost( mi_heap_t* heap, size_t block_size, long atmost) {
   if (atmost < 0) return false;
@@ -222,11 +268,8 @@ static mi_decl_noinline bool mi_abandoned_page_try_reclaim(mi_page_t* page, long
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_is_abandoned(page));
   mi_assert_internal(!mi_page_all_free(page));
-
-  mi_assert(page->block_size <= MI_SMALL_MAX_OBJ_SIZE);
-  mi_assert(reclaim_on_free >= 0);
-  // if (page->block_size > MI_SMALL_MAX_OBJ_SIZE) return false;      // only for small sized blocks
-  // if (reclaim_on_free < 0) return false;                           // and reclaiming is allowed
+  mi_assert_internal(page->block_size <= MI_SMALL_SIZE_MAX);
+  mi_assert_internal(reclaim_on_free >= 0);
 
   // get our heap (with the right tag)
   // note: don't use `mi_heap_get_default()` as we may just have terminated this thread and we should
@@ -270,44 +313,6 @@ static mi_decl_noinline bool mi_abandoned_page_try_reclaim(mi_page_t* page, long
 }
 
 
-// Helper for `mi_free_collect_mt`: try to free, reclaim, or re-abandon to mapped a page.
-static bool mi_abandoned_page_try_collect(mi_page_t* page, long reclaim_on_free) mi_attr_noexcept 
-{
-  mi_assert_internal(mi_page_is_owned(page));
-  mi_assert_internal(mi_page_is_abandoned(page));
-  
-  // 1. free if the page has no more used blocks  (this is updated by `_mi_page_free_collect(_partly)`)
-  if (mi_page_all_free(page)) {
-    // first remove it from the abandoned pages in the arena (if mapped, this might wait for any readers to finish)
-    _mi_arenas_page_unabandon(page);
-    // we can free the page directly
-    _mi_arenas_page_free(page,NULL);
-    return true;
-  }
-
-  // 2. can we reclaim the page?
-  if (reclaim_on_free >= 0 && page->block_size <= MI_SMALL_MAX_OBJ_SIZE && 
-      mi_abandoned_page_try_reclaim(page,reclaim_on_free)) {
-    return true;
-  }
-  
-  // 3. if the page is unmapped, try to reabandon so it can possibly be mapped and found for allocations
-  // We only reabandon if a full page starts to have enough blocks available to prevent immediate re-abandon of a full page
-  // (but we only do this for smaller blocks where page->reserved > 16 to not waste too much space)
-  if (!mi_page_is_mostly_used(page) && page->memid.memkind == MI_MEM_ARENA && !mi_page_is_abandoned_mapped(page))
-  {
-    // note: a page might still look full (reserved == used) if we only did a `_mi_page_collect_free_partly`.
-    // however, we only do a partly collect for small block sizes in which case `mi_page_is_mostly_used` will be false.
-    // (this does not hold once a page->reserved <= 8 since a single free block may make it no longer mostly used)
-    mi_assert(!mi_page_is_full(page));
-    if (_mi_arenas_page_try_reabandon_to_mapped(page)) {  
-      return true;
-    }
-  }
-
-  return false;
-}
-
 // We freed a block in an abandoned page (that was not owned). Try to collect 
 static void mi_decl_noinline mi_free_try_collect_mt(mi_page_t* page, mi_block_t* mt_free) mi_attr_noexcept 
 {
@@ -316,7 +321,7 @@ static void mi_decl_noinline mi_free_try_collect_mt(mi_page_t* page, mi_block_t*
   mi_assert_internal(mt_free != NULL);
 
   // we own the page now, and it is safe to collect the thread atomic free list
-  if (page->block_size <= MI_SMALL_MAX_OBJ_SIZE) {
+  if (page->block_size <= MI_SMALL_SIZE_MAX) {
     // use the `_partly` version to avoid atomic operations since we already have the `mt_free` pointing into the thread free list
     // (after this the `used` count might be too high (as some blocks may have been concurrently added to the thread free list and are yet uncounted).
     //  however, if the page became completely free, the used count is guaranteed to be 0.)
@@ -324,50 +329,25 @@ static void mi_decl_noinline mi_free_try_collect_mt(mi_page_t* page, mi_block_t*
   }
   else {
     // for larger blocks we use the regular collect 
+    // note: this means for blocks larger than ~8 KiB (1/8th of a slice) we have !mi_page_is_mostly_used when even a single block is free.
+    //       (and thus, those can be reabandoned to mapped)
     _mi_page_free_collect(page,false /* no force */);
   }
+  const long reclaim_on_free = _mi_option_get_fast(mi_option_page_reclaim_on_free);  
   #if MI_DEBUG > 1
   if (mi_page_is_singleton(page)) { mi_assert_internal(mi_page_all_free(page)); }
-  if (mi_page_is_full(page))      { mi_assert(mi_page_is_mostly_used(page)); }    // see note in mi_abandoned_page_try_collect
+  if (mi_page_is_full(page))      { mi_assert(mi_page_is_mostly_used(page)); }    
   #endif
-
-  const long reclaim_on_free = _mi_option_get_fast(mi_option_page_reclaim_on_free);
-  if (mi_abandoned_page_try_collect(page,reclaim_on_free)) {
-    return;
+  
+  // try to: 1. free it, 2. reclaim it, or 3. reabandon it to be mapped
+  if (mi_abandoned_page_try_free(page)) return;
+  if (page->block_size <= MI_SMALL_SIZE_MAX && reclaim_on_free >= 0) {  // early test for better codegen
+    if (mi_abandoned_page_try_reclaim(page, reclaim_on_free)) return;
   }
-
-  // not freed, reclaimed, or re-abandoned to mapped: unown the page again
-  mi_page_unown_from_free(page, mt_free);
-}
-
-// release ownership of a page. This may free or reabandond the page if other blocks are concurrently
-// freed in the meantime. Returns `true` if the page was freed or reabandoned to mapped.
-// This is a specialized version of `mi_page_unown` to (try to) avoid calling `mi_page_free_collect` again.
-static bool mi_page_unown_from_free(mi_page_t* page, mi_block_t* mt_free) {
-  mi_assert_internal(mi_page_is_owned(page));
-  mi_assert_internal(mi_page_is_abandoned(page));
-  mi_assert_internal(mt_free != NULL);
-  mi_assert_internal(!mi_page_all_free(page));
-  // try to cas atomically the original free list (`mt_free`) back with the ownership cleared.
-  mi_thread_free_t tf_expect = mi_tf_create(mt_free, true);
-  mi_thread_free_t tf_new    = mi_tf_create(mt_free, false);
-  while mi_unlikely(!mi_atomic_cas_weak_acq_rel(&page->xthread_free, &tf_expect, tf_new)) {
-    mi_assert_internal(mi_tf_is_owned(tf_expect));
-    // while the xthread_free list is not empty..
-    while (mi_tf_block(tf_expect) != NULL) {
-      // if there were concurrent updates to the thread-free list, we retry collection
-      // to ensure the page is either freed (if all blocks are freed now) or reabandoned to mapped (if it became !mosty_used).
-      _mi_page_free_collect(page,false);  // update used count 
-      if (mi_abandoned_page_try_collect(page, -1 /* no reclaim at this point */)) {
-        return true;
-      }
-      tf_expect = mi_atomic_load_relaxed(&page->xthread_free);
-    }
-    // and try again to release ownership
-    mi_assert_internal(mi_tf_block(tf_expect)==NULL);
-    tf_new = mi_tf_create(NULL, false);
-  }
-  return false;
+  if (mi_abandoned_page_try_reabandon_to_mapped(page)) return;
+  
+  // otherwise unown the page again
+  mi_abandoned_page_unown_from_free(page, mt_free);
 }
 
 
