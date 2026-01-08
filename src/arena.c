@@ -750,7 +750,7 @@ static mi_page_t* mi_arenas_page_alloc_fresh(size_t slice_count, size_t block_si
 
   // stats
   mi_tld_stat_increase(tld, pages, 1);
-  mi_tld_stat_increase(tld, page_bins[_mi_page_bin(page)], 1);
+  mi_tld_stat_increase(tld, page_bins[_mi_page_stats_bin(page)], 1);
 
   mi_assert_internal(_mi_ptr_page(page)==page);
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
@@ -854,11 +854,11 @@ void _mi_arenas_page_free(mi_page_t* page, mi_tld_t* stats_tld /* can be NULL */
   mi_assert_internal(page->next==NULL && page->prev==NULL);
 
   if (stats_tld != NULL) { 
-    mi_tld_stat_decrease(stats_tld, page_bins[_mi_page_bin(page)], 1);
+    mi_tld_stat_decrease(stats_tld, page_bins[_mi_page_stats_bin(page)], 1);
     mi_tld_stat_decrease(stats_tld, pages, 1);
   }
   else {
-    mi_os_stat_decrease(page_bins[_mi_page_bin(page)], 1);
+    mi_os_stat_decrease(page_bins[_mi_page_stats_bin(page)], 1);
     mi_os_stat_decrease(pages, 1);
   }
 
@@ -1154,17 +1154,19 @@ void _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc) {
   Add an arena.
 ----------------------------------------------------------- */
 
-static bool mi_arenas_add(mi_subproc_t* subproc, mi_arena_t* arena, mi_arena_id_t* arena_id) {
+static bool mi_arenas_add(mi_subproc_t* subproc, mi_arena_t* arena, mi_arena_id_t* arena_id)
+{
   mi_assert_internal(arena != NULL);
   mi_assert_internal(arena->slice_count > 0);
   if (arena_id != NULL) { *arena_id = NULL; }
 
-  // first try to find a NULL entry
-  const size_t count = mi_arenas_get_count(subproc);
-  size_t i;
-  for (i = 0; i < count; i++) {
-    if (mi_arena_from_index(subproc,i) == NULL) {
-      mi_arena_t* expected = NULL;
+  // try to find a NULL entry
+  mi_arena_t* expected;
+  size_t count = mi_arenas_get_count(subproc);
+  for (size_t i = 0; i < count; i++) {
+    if (mi_arena_from_index(subproc, i) == NULL) {
+      // arena->arena_idx = i;
+      expected = NULL;
       if (mi_atomic_cas_ptr_strong_release(mi_arena_t, &subproc->arenas[i], &expected, arena)) {
         // success
         if (arena_id != NULL) { *arena_id = arena; }
@@ -1173,18 +1175,23 @@ static bool mi_arenas_add(mi_subproc_t* subproc, mi_arena_t* arena, mi_arena_id_
     }
   }
 
-  // otherwise increase the max
-  i = mi_atomic_increment_acq_rel(&subproc->arena_count);
-  if (i >= MI_MAX_ARENAS) {
-    mi_atomic_decrement_acq_rel(&subproc->arena_count);
-    arena->subproc = NULL;
-    return false;
+  // otherwise, try to allocate a fresh slot
+  while (count<MI_MAX_ARENAS) {
+    if (mi_atomic_cas_strong_release(&subproc->arena_count, &count, count+1)) {
+      // arena->arena_idx = count;
+      expected = NULL;
+      if (mi_atomic_cas_ptr_strong_release(mi_arena_t, &subproc->arenas[count], &expected, arena)) {
+        mi_subproc_stat_counter_increase(arena->subproc, arena_count, 1);
+        if (arena_id != NULL) { *arena_id = arena; }
+        return true;
+      }
+    }
   }
 
-  mi_subproc_stat_counter_increase(arena->subproc, arena_count, 1);
-  mi_atomic_store_ptr_release(mi_arena_t,&subproc->arenas[i], arena);
-  if (arena_id != NULL) { *arena_id = arena; }
-  return true;
+  // failed
+  // arena->arena_idx = 0;
+  arena->subproc = NULL;
+  return false;
 }
 
 static size_t mi_arena_info_slices_needed(size_t slice_count, size_t* bitmap_base) {
@@ -1401,7 +1408,8 @@ static size_t mi_debug_show_bfield(mi_bfield_t field, char* buf, size_t* k) {
   for (int bit = 0; bit < MI_BFIELD_BITS; bit++) {
     bool is_set = ((((mi_bfield_t)1 << bit) & field) != 0);
     if (is_set) bit_set_count++;
-    buf[*k++] = (is_set ? 'x' : '.');
+    buf[*k] = (is_set ? 'x' : '.');
+    *k = *k + 1;
   }
   return bit_set_count;
 }
@@ -1552,7 +1560,7 @@ static size_t mi_debug_show_chunks(const char* header1, const char* header2, con
     }
     _mi_raw_message("  %s\n\x1B[37m", buf);
   }
-  _mi_raw_message("\x1B[0m  total ('x'): %zu\n", bit_set_count);
+  _mi_raw_message("\x1B[0m  total pages: %zu\n", bit_set_count);
   return bit_set_count;
 }
 
@@ -1584,8 +1592,8 @@ static void mi_debug_show_arenas_ex(bool show_pages, bool narrow) mi_attr_noexce
     //  purge_total += mi_debug_show_bitmap("purgeable slices", arena->slice_count, arena->slices_purge, false, NULL);
     //}
     if (show_pages) {
-      const char* header1 = "pages (p:page, f:full, s:singleton, P,F,S:not abandoned, i:arena-info, m:meta-data, ~:free-purgable, _:free-committed, .:free-reserved)";
-      const char* header2 = (narrow ? "\n      " : " ");
+      const char* header1 = "chunks (p:page, f:full, s:singleton, P,F,S:not abandoned, i:arena-info, m:meta-data, ~:free-purgable, _:free-committed, .:free-reserved)";
+      const char* header2 = (narrow ? "\n       " : " ");
       const char* header3 = "(chunk bin: S:small, M : medium, L : large, X : other)";
       page_total += mi_debug_show_bitmap_binned(header1, header2, header3, arena->slice_count, arena->pages, arena->slices_free->chunkmap_bins, false, arena, narrow);
     }
@@ -1596,7 +1604,7 @@ static void mi_debug_show_arenas_ex(bool show_pages, bool narrow) mi_attr_noexce
 }
 
 void mi_debug_show_arenas(void) mi_attr_noexcept {
-  mi_debug_show_arenas_ex(true /* show pages */, false /* narrow? */);
+  mi_debug_show_arenas_ex(true /* show pages */, true /* narrow? */);
 }
 
 void mi_arenas_print(void) mi_attr_noexcept {
@@ -1806,8 +1814,11 @@ static bool mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
   // this also clears those ranges atomically (so any newly freed blocks will get purged next
   // time around)
   mi_purge_visit_info_t vinfo = { now, mi_arena_purge_delay(), true /*all?*/, false /*any?*/};
-  _mi_bitmap_forall_setc_ranges(arena->slices_purge, &mi_arena_try_purge_visitor, arena, &vinfo);
 
+  // we purge by at least `minslices` to not fragment transparent huge pages for example
+  const size_t minslices = mi_slice_count_of_size(_mi_os_minimal_purge_size());
+  _mi_bitmap_forall_setc_rangesn(arena->slices_purge, minslices, &mi_arena_try_purge_visitor, arena, &vinfo);
+  
   return vinfo.any_purged;
 }
 

@@ -126,6 +126,7 @@ void          _mi_strlcpy(char* dest, const char* src, size_t dest_size);
 void          _mi_strlcat(char* dest, const char* src, size_t dest_size);
 size_t        _mi_strlen(const char* s);
 size_t        _mi_strnlen(const char* s, size_t max_len);
+char*         _mi_strnstr(char* s, size_t max_len, const char* pat);
 bool          _mi_getenv(const char* name, char* result, size_t result_size);
 
 // "options.c"
@@ -184,6 +185,7 @@ size_t        _mi_os_good_alloc_size(size_t size);
 bool          _mi_os_has_overcommit(void);
 bool          _mi_os_has_virtual_reserve(void);
 size_t        _mi_os_virtual_address_bits(void);
+size_t        _mi_os_minimal_purge_size(void);
 
 bool          _mi_os_reset(void* addr, size_t size);
 bool          _mi_os_decommit(void* addr, size_t size);
@@ -208,7 +210,7 @@ void*         _mi_os_alloc_aligned(size_t size, size_t alignment, bool commit, b
 void*         _mi_os_alloc_aligned_at_offset(size_t size, size_t alignment, size_t align_offset, bool commit, bool allow_large, mi_memid_t* memid);
 
 void*         _mi_os_get_aligned_hint(size_t try_alignment, size_t size);
-bool          _mi_os_use_large_page(size_t size, size_t alignment);
+bool          _mi_os_canuse_large_page(size_t size, size_t alignment);
 size_t        _mi_os_large_page_size(void);
 void*         _mi_os_alloc_huge_os_pages(size_t pages, int numa_node, mi_msecs_t max_secs, size_t* pages_reserved, size_t* psize, mi_memid_t* memid);
 
@@ -261,9 +263,9 @@ void          _mi_page_free_collect_partly(mi_page_t* page, mi_block_t* head);
 mi_decl_nodiscard bool _mi_page_init(mi_heap_t* heap, mi_page_t* page);
 bool          _mi_page_queue_is_valid(mi_heap_t* heap, const mi_page_queue_t* pq);
 
-size_t        _mi_page_bin(const mi_page_t* page); // for stats
-size_t        _mi_bin_size(size_t bin);            // for stats
-size_t        _mi_bin(size_t size);                // for stats
+size_t        _mi_page_stats_bin(const mi_page_t* page); // for stats
+size_t        _mi_bin_size(size_t bin);                  // for stats
+size_t        _mi_bin(size_t size);                      // for stats
 
 // "heap.c"
 mi_heap_t*    _mi_heap_create(int heap_tag, bool allow_destroy, mi_arena_id_t arena_id, mi_tld_t* tld);
@@ -814,7 +816,7 @@ static inline void mi_page_set_heap(mi_page_t* page, mi_heap_t* heap) {
   }
   const mi_threadid_t tid = (heap == NULL ? MI_THREADID_ABANDONED : heap->tld->thread_id);
   mi_assert_internal((tid & MI_PAGE_FLAG_MASK) == 0);
-  
+
   // we need to use an atomic cas since a concurrent thread may still set the MI_PAGE_HAS_INTERIOR_POINTERS flag (see `alloc_aligned.c`).
   mi_threadid_t xtid_old = mi_page_xthread_id(page);
   mi_threadid_t xtid;
