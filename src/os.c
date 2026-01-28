@@ -192,7 +192,7 @@ static void mi_os_prim_free(void* addr, size_t size, size_t commit_size, mi_subp
   if (err != 0) {
     _mi_warning_message("unable to free OS memory (error: %d (0x%x), size: 0x%zx bytes, address: %p)\n", err, err, size, addr);
   }
-  if (subproc == NULL) { subproc = _mi_subproc(); } // from `mi_arenas_unsafe_destroy` we pass subproc_main explicitly as we can no longer use the heap pointer
+  if (subproc == NULL) { subproc = _mi_subproc(); } // from `mi_arenas_unsafe_destroy` we pass subproc_main explicitly as we can no longer use the theap pointer
   if (commit_size > 0) {
     mi_subproc_stat_decrease(subproc, committed, commit_size);
   }
@@ -551,7 +551,7 @@ bool _mi_os_reset(void* addr, size_t size) {
   size_t csize;
   void* start = mi_os_page_align_area_conservative(addr, size, &csize);
   if (csize == 0) return true;  // || _mi_os_is_huge_reserved(addr)
-  mi_os_stat_increase(reset, csize);
+  mi_os_stat_counter_increase(reset, csize);
   mi_os_stat_counter_increase(reset_calls, 1);
 
   #if (MI_DEBUG>1) && !MI_SECURE && !MI_TRACK_ENABLED // && !MI_TSAN
@@ -583,7 +583,7 @@ bool _mi_os_purge_ex(void* p, size_t size, bool allow_reset, size_t stat_size, m
 {
   if (mi_option_get(mi_option_purge_delay) < 0) return false;  // is purging allowed?
   mi_os_stat_counter_increase(purge_calls, 1);
-  mi_os_stat_increase(purged, size);
+  mi_os_stat_counter_increase(purged, size);
 
   if (commit_fun != NULL) {
     bool decommitted = (*commit_fun)(false, p, size, NULL, commit_fun_arg);
@@ -664,7 +664,7 @@ static uint8_t* mi_os_claim_huge_pages(size_t pages, size_t* total_size) {
       // Initialize the start address after the 32TiB area
       start = ((uintptr_t)8 << 40);   // 8TiB virtual start address
     #if (MI_SECURE>0 || MI_DEBUG==0)  // security: randomize start of huge pages unless in debug mode
-      uintptr_t r = _mi_heap_random_next(mi_prim_get_default_heap());
+      uintptr_t r = _mi_theap_random_next(_mi_theap_default());
       start = start + ((uintptr_t)MI_HUGE_OS_PAGE_SIZE * ((r>>17) & 0x0FFF));  // (randomly 12bits)*1GiB == between 0 to 4TiB
     #endif
     }
@@ -786,7 +786,7 @@ int _mi_os_numa_node_count(void) {
                             else { count = n; }
     }
     mi_atomic_store_release(&mi_numa_node_count, count); // save it
-    _mi_verbose_message("using %zd numa regions\n", count);
+    if (count>1) { _mi_verbose_message("using %zd numa regions\n", count); }
   }
   mi_assert_internal(count > 0 && count <= INT_MAX);
   return (int)count;

@@ -69,6 +69,8 @@ set(mi_sources
     src/page-map.c
     src/random.c
     src/stats.c
+    src/theap.c
+    src/threadlocal.c
     src/prim/prim.c)
 
 set(mi_cflags "")
@@ -209,7 +211,7 @@ if(MI_OVERRIDE)
     if(MI_OSX_ZONE)
       # use zone's on macOS
       message(STATUS "  Use malloc zone to override malloc (MI_OSX_ZONE=ON)")
-      list(APPEND mi_sources src/prim/osx/alloc-override-zone.c)      
+      list(APPEND mi_sources src/prim/osx/alloc-override-zone.c)
       list(APPEND mi_defines MI_OSX_ZONE=1)
       if (NOT MI_OSX_INTERPOSE)
         message(STATUS "  WARNING: zone overriding usually also needs interpose (use -DMI_OSX_INTERPOSE=ON)")
@@ -357,13 +359,13 @@ if(MI_DEBUG_TSAN)
 endif()
 
 if(MI_DEBUG_UBSAN)
-  if(CMAKE_BUILD_TYPE MATCHES "Debug")    
+  if(CMAKE_BUILD_TYPE MATCHES "Debug")
     if(MI_USE_CXX)
       if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         message(STATUS "Build with undefined-behavior sanitizer (MI_DEBUG_UBSAN=ON)")
         list(APPEND mi_defines MI_UBSAN=1)
         list(APPEND mi_cflags -fsanitize=undefined -g -fno-sanitize-recover=undefined)
-        list(APPEND mi_libraries -fsanitize=undefined)        
+        list(APPEND mi_libraries -fsanitize=undefined)
       else()
         message(WARNING "Can only use undefined-behavior sanitizer with clang++ (MI_DEBUG_UBSAN=ON but ignored)")
       endif()
@@ -503,10 +505,10 @@ function(find_link_library libname outlibname)
     message(VERBOSE "link library: -l${libname}")
     set(${outlibname} ${libname} PARENT_SCOPE)
   else()
-    find_library(MI_LIBPATH libname)
-    if (MI_LIBPATH)
-      message(VERBOSE "link library ${libname} at ${MI_LIBPATH}")
-      set(${outlibname} ${MI_LIBPATH} PARENT_SCOPE)
+    find_library(MI_LIBPATH_${libname} ${libname})
+    if (MI_LIBPATH_${libname})
+      message(VERBOSE "link library ${libname} at ${MI_LIBPATH_${libname}}")
+      set(${outlibname} ${MI_LIBPATH_${libname}} PARENT_SCOPE)
     else()
       message(VERBOSE "link library not found: ${libname}")
       set(${outlibname} "" PARENT_SCOPE)
