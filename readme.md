@@ -265,33 +265,52 @@ and statistics (`MIMALLOC_SHOW_STATS=1`) (in the debug version):
 
 175451865205073170563711388363 = 374456281610909315237213 * 468551
 
-heap stats:     peak      total      freed       unit
-normal   2:    16.4 kb    17.5 mb    17.5 mb      16 b   ok
-normal   3:    16.3 kb    15.2 mb    15.2 mb      24 b   ok
-normal   4:      64 b      4.6 kb     4.6 kb      32 b   ok
-normal   5:      80 b    118.4 kb   118.4 kb      40 b   ok
-normal   6:      48 b       48 b       48 b       48 b   ok
-normal  17:     960 b      960 b      960 b      320 b   ok
+subproc 0
+ blocks          peak       total     current       block      total#
+  bin S    4:    75.3 KiB    55.2 MiB     0          32   B       1.8 M    ok
+  bin S    6:    31.0 KiB   180.4 KiB     0          48   B       3.8 K    ok
+  bin S    8:    64   B      64   B       0          64   B       1        ok
+  bin S    9:   160   B     160   B       0          80   B       2        ok
+  bin S   17:     1.2 KiB     1.2 KiB     0         320   B       4        ok
+  bin S   21:   640   B       3.1 KiB     0         640   B       5        ok
+  bin S   33:     5.0 KiB     5.0 KiB     0           5.0 KiB     1        ok
 
-heap stats:     peak      total      freed       unit
-    normal:    33.9 kb    32.8 mb    32.8 mb       1 b   ok
-      huge:       0 b        0 b        0 b        1 b   ok
-     total:    33.9 kb    32.8 mb    32.8 mb       1 b   ok
-malloc requested:         32.8 mb
+  binned    :    84.2 Ki     41.5 Mi      0                                ok
+  huge      :     0           0           0                                ok
+  total     :    84.2 KiB    41.5 MiB     0
+  malloc req:                29.7 MiB
 
- committed:    58.2 kb    58.2 kb    58.2 kb       1 b   ok
-  reserved:     2.0 mb     2.0 mb     2.0 mb       1 b   ok
-     reset:       0 b        0 b        0 b        1 b   ok
-  segments:       1          1          1
--abandoned:       0
-     pages:       6          6          6
--abandoned:       0
-     mmaps:       3
- mmap fast:       0
- mmap slow:       1
-   threads:       0
-   elapsed:     2.022s
-   process: user: 1.781s, system: 0.016s, faults: 756, reclaims: 0, rss: 2.7 mb
+ pages           peak       total     current       block      total#
+  touched   :   152.8 KiB   152.8 KiB   152.8 KiB
+  pages     :     8          14           0                                ok
+  abandoned :     1         249           0                                ok
+  reclaima  :     0
+  reclaimf  :   249
+  reabandon :     0
+  waits     :     0
+  extended  :    38
+  retire    :    35
+  searches  :     0.7 avg
+
+ arenas          peak       total     current       block      total#
+  reserved  :     1.0 GiB     1.0 GiB     1.0 GiB
+  committed :     4.8 MiB     4.8 MiB     4.4 MiB
+  reset     :     0
+  purged    :   385.5 Ki
+  arenas    :     1
+  rollback  :     0
+  mmaps     :     3
+  commits   :     0
+  resets    :     1
+  purges    :     2
+  guarded   :     0
+  heaps     :     1           1           1
+
+ process         peak       total     current       block      total#
+  threads   :     1           1           1
+  numa nodes:     1
+  elapsed   :     0.553 s
+  process   : user: 0.557 s, system: 0.013 s, faults: 29, peak rss: 2.1 MiB, peak commit: 4.8 MiB
 ```
 
 The above model of using the `mi_` prefixed API is not always possible
@@ -648,7 +667,7 @@ as [mimalloc-bench](https://github.com/daanx/mimalloc-bench).
 ## Benchmark Results on a 16-core AMD 5950x (Zen3)
 
 Testing on the 16-core AMD 5950x processor at 3.4Ghz (4.9Ghz boost), with
-with 32GiB memory at 3600Mhz, running	Ubuntu 20.04 with glibc 2.31 and GCC 9.3.0.
+32GiB memory at 3600Mhz, running	Ubuntu 20.04 with glibc 2.31 and GCC 9.3.0.
 
 We measure three versions of _mimalloc_: the main version `mi` (tag:v1.7.0),
 the new v2.0 beta version as `xmi` (tag:v2.0.0), and the main version in secure mode as `smi` (tag:v1.7.0).

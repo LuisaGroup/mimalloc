@@ -34,7 +34,7 @@
  <tr id="projectrow">
   <td id="projectlogo"><img alt="Logo" src="mimalloc-logo.svg"/></td>
   <td id="projectalign">
-   <div id="projectname">mi-malloc<span id="projectnumber">&#160;3.2</span>
+   <div id="projectname">mi-malloc<span id="projectnumber">&#160;v1.9,  v2.2,  v3.2</span>
    </div>
   </td>
     <td>        <div id="MSearchBox" class="MSearchBoxInactive">
@@ -121,7 +121,7 @@ $(function(){initNavTree('overrides.html',''); initResizable(true); });
 <p><span id="override_on_windows">Dynamically overriding on mimalloc on Windows</span> is robust and has the particular advantage to be able to redirect all malloc/free calls that go through the (dynamic) C runtime allocator, including those from other DLL's or libraries. As it intercepts all allocation calls on a low level, it can be used reliably on large programs that include other 3rd party components. There are four requirements to make the overriding work well:</p>
 <ol type="1">
 <li>Use the C-runtime library as a DLL (using the <code>/MD</code> or <code>/MDd</code> switch).</li>
-<li>Link your program explicitly with the <code>mimalloc.lib</code> export library for the <code>mimalloc.dll</code>. (which must be compiled with <code>-DMI_OVERRIDE=ON</code>, which is the default though). To ensure the <code>mimalloc.dll</code> is actually loaded at run-time it is easiest to insert some call to the mimalloc API in the <code>main</code> function, like <code>mi_version()</code> (or use the <code>/include:mi_version</code> switch on the linker command, or similarly, <code>#pragma comment(linker, "/include:mi_version")</code> in some source file). See the <code>mimalloc-test-override</code> project for an example on how to use this.</li>
+<li>Link your program explicitly with the <code>mimalloc.lib</code> export library for the <code>mimalloc.dll</code>. (which must be compiled with <code>-DMI_OVERRIDE=ON</code>, which is the default though). To ensure the <code>mimalloc.dll</code> is actually loaded at run-time it is easiest to insert some call to the mimalloc API in the <code>main</code> function, like <code><a class="el" href="group__extended.html#gae9ddddcf14a58d0224ef3c8778e5b057" title="Return the mimalloc version.">mi_version()</a></code> (or use the <code>/include:mi_version</code> switch on the linker command, or similarly, <code>#pragma comment(linker, "/include:mi_version")</code> in some source file). See the <code>mimalloc-test-override</code> project for an example on how to use this.</li>
 <li>The <code>mimalloc-redirect.dll</code> must be put in the same directory as the main <code>mimalloc.dll</code> at runtime (as it is a dependency of that DLL). The redirection DLL ensures that all calls to the C runtime malloc API get redirected to mimalloc functions (which reside in <code>mimalloc.dll</code>).</li>
 <li>Ensure the <code>mimalloc.dll</code> comes as early as possible in the import list of the final executable (so it can intercept all potential allocations). You can use <code>minject -l &lt;exe&gt;</code> to check this if needed.</li>
 </ol>

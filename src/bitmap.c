@@ -597,7 +597,7 @@ static inline bool mi_bchunk_try_find_and_clear_at(mi_bchunk_t* chunk, size_t ch
 // todo: try neon version
 static inline bool mi_bchunk_try_find_and_clear(mi_bchunk_t* chunk, size_t* pidx) {
   #if MI_OPT_SIMD && defined(__AVX2__) && (MI_BCHUNK_BITS==256)
-  while (true) {
+  for(int tries=0; tries<4; tries++) {   // paranoia: at most 4 tries
     const __m256i vec = _mm256_load_si256((const __m256i*)chunk->bfields);
     const __m256i vcmp = _mm256_cmpeq_epi64(vec, mi_mm256_zero()); // (elem64 == 0 ? 0xFF  : 0)
     const uint32_t mask = ~_mm256_movemask_epi8(vcmp);  // mask of most significant bit of each byte (so each 8 bits are all set or clear)
@@ -608,9 +608,13 @@ static inline bool mi_bchunk_try_find_and_clear(mi_bchunk_t* chunk, size_t* pidx
     if (mi_bchunk_try_find_and_clear_at(chunk, chunk_idx, pidx)) return true;
     // try again
     // note: there must be an atomic release/acquire in between or otherwise the registers may not be reloaded
+    // we add an explicit memory barrier as older gcc compilers do not reload the registers even with an atomic acquire (issue #1206)
+    #if defined(__GNUC__)
+    __asm __volatile ("" : : "g"(chunk) : "memory");
+    #endif
   }
   #elif MI_OPT_SIMD && defined(__AVX2__) && (MI_BCHUNK_BITS==512)
-  while (true) {
+  for(int tries=0; tries<4; tries++) {   // paranoia: at most 4 tries
     size_t chunk_idx = 0;
     #if 0
     // one vector at a time
@@ -643,9 +647,13 @@ static inline bool mi_bchunk_try_find_and_clear(mi_bchunk_t* chunk, size_t* pidx
     if (mi_bchunk_try_find_and_clear_at(chunk, chunk_idx, pidx)) return true;
     // try again
     // note: there must be an atomic release/acquire in between or otherwise the registers may not be reloaded
+    // we add an explicit memory barrier as older gcc compilers do not reload the registers even with an atomic acquire (issue #1206)
+    #if defined(__GNUC__)
+    __asm __volatile ("" : : "g"(chunk) : "memory");
+    #endif
   }
   #elif MI_OPT_SIMD && (MI_BCHUNK_BITS==512) && MI_ARCH_ARM64
-  while(true) {
+  for(int tries=0; tries<4; tries++) {   // paranoia: at most 4 tries
     // a cache line is 64b so we can just as well load all at the same time (?)
     const uint64x2_t vzero1_lo = vceqzq_u64(vld1q_u64((uint64_t*)chunk->bfields));        // 2x64 bit is_zero
     const uint64x2_t vzero1_hi = vceqzq_u64(vld1q_u64((uint64_t*)chunk->bfields + 2));    // 2x64 bit is_zero
@@ -664,13 +672,17 @@ static inline bool mi_bchunk_try_find_and_clear(mi_bchunk_t* chunk, size_t* pidx
     if (mi_bchunk_try_find_and_clear_at(chunk, chunk_idx, pidx)) return true;
     // try again
     // note: there must be an atomic release/acquire in between or otherwise the registers may not be reloaded
+    // we add an explicit memory barrier as older gcc compilers do not reload the registers even with an atomic acquire (issue #1206)
+    #if defined(__GNUC__)
+    __asm __volatile ("" : : "g"(chunk) : "memory");
+    #endif
   }
   #else
   for (int i = 0; i < MI_BCHUNK_FIELDS; i++) {
     if (mi_bchunk_try_find_and_clear_at(chunk, i, pidx)) return true;
   }
-  return false;
   #endif
+  return false;  
 }
 
 static inline bool mi_bchunk_try_find_and_clear_1(mi_bchunk_t* chunk, size_t n, size_t* pidx) {

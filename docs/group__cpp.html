@@ -34,7 +34,7 @@
  <tr id="projectrow">
   <td id="projectlogo"><img alt="Logo" src="mimalloc-logo.svg"/></td>
   <td id="projectalign">
-   <div id="projectname">mi-malloc<span id="projectnumber">&#160;3.2</span>
+   <div id="projectname">mi-malloc<span id="projectnumber">&#160;v1.9,  v2.2,  v3.2</span>
    </div>
   </td>
     <td>        <div id="MSearchBox" class="MSearchBoxInactive">
@@ -114,7 +114,7 @@ $(function(){initNavTree('group__cpp.html',''); initResizable(true); });
 <tr class="heading"><td colspan="2"><h2 class="groupheader"><a id="nested-classes" name="nested-classes"></a>
 Data Structures</h2></td></tr>
 <tr class="memitem:structmi__stl__allocator" id="r_structmi__stl__allocator"><td class="memItemLeft" align="right" valign="top">struct &#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="#structmi__stl__allocator">mi_stl_allocator&lt; T &gt;</a></td></tr>
-<tr class="memdesc:structmi__stl__allocator"><td class="mdescLeft">&#160;</td><td class="mdescRight"><em>std::allocator</em> implementation for mimalloc for use in STL containers.  <a href="#structmi__stl__allocator">More...</a><br /></td></tr>
+<tr class="memdesc:structmi__stl__allocator"><td class="mdescLeft">&#160;</td><td class="mdescRight"><em>std::allocator</em> implementation for mimalloc for use in STL containers. For example:  <a href="#structmi__stl__allocator">More...</a><br /></td></tr>
 <tr class="separator:structmi__stl__allocator"><td class="memSeparator" colspan="2">&#160;</td></tr>
 </table><table class="memberdecls">
 <tr class="heading"><td colspan="2"><h2 class="groupheader"><a id="func-members" name="func-members"></a>
@@ -157,8 +157,8 @@ Functions</h2></td></tr>
       </table>
 </div><div class="memdoc">
 <div class="textblock"><div class="compoundTemplParams">template&lt;class T&gt;<br />
-struct mi_stl_allocator&lt; T &gt;</div><p><em>std::allocator</em> implementation for mimalloc for use in STL containers. </p>
-<p>For example: </p><div class="fragment"><div class="line">std::vector&lt;int, mi_stl_allocator&lt;int&gt; &gt; vec;</div>
+struct mi_stl_allocator&lt; T &gt;</div><p><em>std::allocator</em> implementation for mimalloc for use in STL containers. For example: </p>
+<div class="fragment"><div class="line">std::vector&lt;int, mi_stl_allocator&lt;int&gt; &gt; vec;</div>
 <div class="line">vec.push_back(1);</div>
 <div class="line">vec.pop_back();</div>
 </div><!-- fragment --> </div>
