@@ -111,6 +111,9 @@ $(function(){initNavTree('group__analysis.html',''); initResizable(true); });
   <div class="headertitle"><div class="title">Heap Introspection</div></div>
 </div><!--header-->
 <div class="contents">
+
+<p>Walk areas and blocks of the heap at runtime.  
+<a href="#details">More...</a></p>
 <table class="memberdecls">
 <tr class="heading"><td colspan="2"><h2 class="groupheader"><a id="nested-classes" name="nested-classes"></a>
 Data Structures</h2></td></tr>
@@ -134,7 +137,7 @@ Functions</h2></td></tr>
 <tr class="separator:ga6a4865a887b2ec5247854af61562503c"><td class="memSeparator" colspan="2">&#160;</td></tr>
 </table>
 <a name="details" id="details"></a><h2 class="groupheader">Detailed Description</h2>
-<p>Inspect the heap at runtime. </p>
+<p>Walk areas and blocks of the heap at runtime. </p>
 <hr/><h2 class="groupheader">Data Structure Documentation</h2>
 <a name="structmi__heap__area__t" id="structmi__heap__area__t"></a>
 <h2 class="memtitle"><span class="permalink"><a href="#structmi__heap__area__t">&#9670;&#160;</a></span>mi_heap_area_t</h2>
@@ -263,7 +266,7 @@ bytes in use by allocated blocks </td></tr>
   </dd>
 </dl>
 <dl class="section return"><dt>Returns</dt><dd><em>true</em> if all areas and blocks were visited.</dd></dl>
-<p>Note: requires the option <code>mi_option_visit_abandoned</code> to be set at the start of the program. </p>
+<p>Note: requires the option <a class="el" href="group__options.html#ggafebf7ed116adb38ae5218bc3ce06884ca38c67733a3956a1f4eeaca89fab9e78e" title="allow visiting heap blocks from abandoned threads (=0)">mi_option_visit_abandoned()</a> to be set at the start of the program. </p>
 
 </div>
 </div>
@@ -307,7 +310,7 @@ bytes in use by allocated blocks </td></tr>
   </dd>
 </dl>
 <dl class="section return"><dt>Returns</dt><dd><em>true</em> if all areas and blocks were visited.</dd></dl>
-<p>Note: requires the option <code>mi_option_visit_abandoned</code> to be set at the start of the program to visit all abandoned blocks as well. </p>
+<p>Note: requires the option <a class="el" href="group__options.html#ggafebf7ed116adb38ae5218bc3ce06884ca38c67733a3956a1f4eeaca89fab9e78e" title="allow visiting heap blocks from abandoned threads (=0)">mi_option_visit_abandoned()</a> to be set at the start of the program to visit all abandoned blocks as well. </p>
 
 </div>
 </div>

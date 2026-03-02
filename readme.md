@@ -12,7 +12,7 @@ is a general purpose allocator with excellent [performance](#performance) charac
 Initially developed by Daan Leijen for the runtime systems of the
 [Koka](https://koka-lang.github.io) and [Lean](https://github.com/leanprover/lean) languages.
 
-Latest release   : `v3.2.7` (2026-01-15) release candidate 2, please report any issues.  
+Latest release   : `v3.2.8` (2026-02-03) release candidate 3, please report any issues.  
 Latest v2 release: `v2.2.7` (2026-01-15).  
 Latest v1 release: `v1.9.7` (2026-01-15).
 
@@ -67,27 +67,31 @@ Notable aspects of the design include:
   of benchmarks. There is also good huge OS page support for larger server programs.
 
 The [documentation](https://microsoft.github.io/mimalloc) gives a full overview of the API.
-You can read more on the design of _mimalloc_ in the [technical report](https://www.microsoft.com/en-us/research/publication/mimalloc-free-list-sharding-in-action) which also has detailed benchmark results.
+You can read more on the design of mimalloc in the [technical report](https://www.microsoft.com/en-us/research/publication/mimalloc-free-list-sharding-in-action) which also has detailed benchmark results.
 
 Enjoy!
 
-### Branches
+### Versions
 
-* `main`: latest stable release (still based on `dev2`).
-* `dev`:  development branch for mimalloc v1. Use this branch for submitting PR's.
-* `dev2`: development branch for mimalloc v2. This branch is downstream of `dev` 
-          (and is essentially equal to `dev` except for `src/segment.c`). Uses larger sliced segments to manage
-          mimalloc pages that can reduce fragmentation.
-* `dev3`: development branch for mimalloc v3 rc1. This branch is downstream of `dev`. This version 
-          simplifies the lock-free ownership of previous versions, and improves sharing of memory between 
-          threads. On certain large workloads this version may use (much) less memory.
-          Also support true first-class heaps and more efficient heap-walking.
+There are three maintained versions of mimalloc. These are mostly equal except for how the OS memory is handled. 
+New development is mostly on v3, while v1 and v2 are maintained with security and bug fixes. 
+
+- __v1__: initial design of mimalloc (release tags: `v1.9.x`, development branch `dev`). Send PR's against this version if possible.
+- __v2__: main mimalloc version. Uses thread-local segments to reduce fragmentation. (release tags: `v2.2.x`, development branch `dev2` and `main`)
+- __v3__: simplifies the lock-free design of previous versions and improves sharing of 
+        memory between threads. On certain large workloads this version may use 
+        (much) less memory. Also supports true first-class heaps (that can allocate from any thread) 
+        and has more efficient heap-walking (for the CPython GC for example).
+        (release tags: `v3.2.x`, development branch `dev3`).
 
 ### Releases
 
-* 2026-01-15, `v1.9.7`, `v2.2.7`, `v3.2.7` (rc2) : Fix zero initializing blocks that were OS allocated.  
+* 2026-02-03, `v3.2.8` (rc3): Fix thread reinitialize issue on macOS. Fix SIMD codegen bug on older
+  GCC versions. Extend Windows TLS slot limit from 64 to 1088. Report commit statistics more precise.
+  Fixes issue in free-page search in arenas.
+* 2026-01-15, `v1.9.7`, `v2.2.7`, `v3.2.7` (rc2): Fix zero initializing blocks that were OS allocated.  
   For v3 various bug and performance fixes. Fix Debian 32-bit compilation.
-* 2026-01-08, `v1.9.6`, `v2.2.6`, `v3.2.6` (rc1) : Important bug fixes. Many improvements to v3 including 
+* 2026-01-08, `v1.9.6`, `v2.2.6`, `v3.2.6` (rc1): Important bug fixes. Many improvements to v3 including 
   true first-class heaps where one can allocate in heap from any thread, and track statistics per heap as well.
   Added `MIMALLOC_ALLOW_THP` option. This is by default enabled except on Android. When THP is detected on v3,
   mimalloc will set the `MIMALLOC_MINIMAL_PURGE_SIZE` to 2MiB to avoid breaking up potential THP huge pages.

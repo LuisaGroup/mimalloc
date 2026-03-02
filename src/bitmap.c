@@ -962,6 +962,19 @@ static bool mi_bchunk_bsr(mi_bchunk_t* chunk, size_t* pidx) {
   return false;
 }
 
+static bool mi_bchunk_bsr_inv(mi_bchunk_t* chunk, size_t* pidx) {
+  for (size_t i = MI_BCHUNK_FIELDS; i > 0; ) {
+    i--;
+    mi_bfield_t b = mi_atomic_load_relaxed(&chunk->bfields[i]);
+    size_t idx;
+    if (mi_bsr(~b, &idx)) {
+      *pidx = (i*MI_BFIELD_BITS) + idx;
+      return true;
+    }
+  }
+  return false;
+}
+
 static size_t mi_bchunk_popcount(mi_bchunk_t* chunk) {
   size_t popcount = 0;
   for (size_t i = 0; i < MI_BCHUNK_FIELDS; i++) {
@@ -1547,6 +1560,24 @@ void mi_bbitmap_unsafe_setN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
   mi_bchunks_unsafe_setN(&bbitmap->chunks[0], &bbitmap->chunkmap, idx, n);
 }
 
+bool mi_bbitmap_bsr_inv(mi_bbitmap_t* bbitmap, size_t* idx) {
+  const size_t chunkmap_max = _mi_divide_up(mi_bbitmap_chunk_count(bbitmap), MI_BFIELD_BITS);
+  for (size_t i = chunkmap_max; i > 0; ) {
+    i--;
+    mi_bfield_t cmap = mi_atomic_load_relaxed(&bbitmap->chunkmap.bfields[i]);
+    size_t cmap_idx;
+    if (mi_bsr(~cmap, &cmap_idx)) {
+      // highest chunk
+      const size_t chunk_idx = i*MI_BFIELD_BITS + cmap_idx;
+      size_t cidx;
+      if (mi_bchunk_bsr_inv(&bbitmap->chunks[chunk_idx], &cidx)) {
+        *idx = (chunk_idx * MI_BCHUNK_BITS) + cidx;
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 
 /* --------------------------------------------------------------------------------

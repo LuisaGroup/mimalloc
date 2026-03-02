@@ -8,7 +8,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #ifndef MIMALLOC_H
 #define MIMALLOC_H
 
-#define MI_MALLOC_VERSION 3207   // major + minor + 2 digits patch
+#define MI_MALLOC_VERSION 3208   // major + minor + 2 digits patch
 
 // ------------------------------------------------------
 // Compiler specific attributes
@@ -324,6 +324,7 @@ mi_decl_export bool   mi_manage_os_memory(void* start, size_t size, bool is_comm
 mi_decl_export void   mi_debug_show_arenas(void) mi_attr_noexcept;
 mi_decl_export void   mi_arenas_print(void) mi_attr_noexcept;
 mi_decl_export size_t mi_arena_min_alignment(void);
+mi_decl_export size_t mi_arena_min_size(void);
 
 typedef void* mi_arena_id_t;
 mi_decl_export void*  mi_arena_area(mi_arena_id_t arena_id, size_t* size);

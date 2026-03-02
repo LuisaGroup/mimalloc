@@ -7,8 +7,6 @@ var group__extended =
     [ "mi_collect", "group__extended.html#ga421430e2226d7d468529cec457396756", null ],
     [ "mi_is_redirected", "group__extended.html#gaad25050b19f30cd79397b227e0157a3f", null ],
     [ "mi_malloc_small", "group__extended.html#ga7f050bc6b897da82692174f5fce59cde", null ],
-    [ "mi_options_print", "group__extended.html#gaecfcd3ed90af99932670d881de1fa8f1", null ],
-    [ "mi_options_print_out", "group__extended.html#ga1dd50c7533baec4cc6c1a2e9adf05dd2", null ],
     [ "mi_register_deferred_free", "group__extended.html#ga3460a6ca91af97be4058f523d3cb8ece", null ],
     [ "mi_register_error", "group__extended.html#gaa1d55e0e894be240827e5d87ec3a1f45", null ],
     [ "mi_register_output", "group__extended.html#gae5b17ff027cd2150b43a33040250cf3f", null ],
