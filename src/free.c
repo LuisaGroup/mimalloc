@@ -1,5 +1,5 @@
 /* ----------------------------------------------------------------------------
-Copyright (c) 2018-2025, Microsoft Research, Daan Leijen
+Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -9,7 +9,7 @@ terms of the MIT license. A copy of the license can be found in the file
 // add includes help an IDE
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
-#include "mimalloc/prim.h"   // _mi_prim_thread_id()
+#include "mimalloc/prim-tls.h"   // _mi_prim_thread_id()
 #endif
 
 // forward declarations
@@ -40,7 +40,12 @@ static inline void mi_free_block_local(mi_page_t* page, mi_block_t* block, bool 
   // actual free: push on the local free list
   mi_block_set_next(page, block, page->local_free);
   page->local_free = block;
-  if mi_unlikely(--page->used == 0) {
+  #if defined(__clang__) && defined(__aarch64__)
+  if mi_unlikely(page->used-- == 1)   // better code on arm64 than using `--page->used == 0`
+  #else
+  if mi_unlikely(--page->used == 0)
+  #endif
+  {  
     if (page->retire_expire==0) { // no need to re-retire retired pages (happens when we alloc/free one block repeatedly in an empty page)
       _mi_page_retire(page); 
     }
@@ -54,9 +59,9 @@ static inline void mi_free_block_local(mi_page_t* page, mi_block_t* block, bool 
 static void mi_decl_noinline mi_free_try_collect_mt(mi_page_t* page, mi_block_t* mt_free) mi_attr_noexcept;
 
 // Free a block multi-threaded
-static inline void mi_free_block_mt(mi_page_t* page, mi_block_t* block, bool was_guarded) mi_attr_noexcept
+static inline void mi_free_block_mt(mi_page_t* page, mi_block_t* block, bool was_guarded, bool allow_collect) mi_attr_noexcept
 {
-  MI_UNUSED(was_guarded);
+  MI_UNUSED(was_guarded); 
   // adjust stats (after padding check and potentially recursive `mi_free` above)
   mi_stat_free(page, block);    // stat_free may access the padding
   mi_track_free_size(block, mi_page_usable_size_of(page, block, was_guarded));
@@ -75,21 +80,24 @@ static inline void mi_free_block_mt(mi_page_t* page, mi_block_t* block, bool was
   mi_thread_free_t tf_old = mi_atomic_load_relaxed(&page->xthread_free);
   do {
     mi_block_set_next(page, block, mi_tf_block(tf_old));
-    tf_new = mi_tf_create(block, true /* always use owned: try to claim it if the page is abandoned */);
+    const bool new_owned = (allow_collect ? true : mi_tf_is_owned(tf_old));    // if allow collection then always try to claim it if the page is abandoned 
+    tf_new = mi_tf_create(block, new_owned);
   } while (!mi_atomic_cas_weak_acq_rel(&page->xthread_free, &tf_old, tf_new)); // todo: release is enough?
 
   // and atomically try to collect the page if it was abandoned
-  const bool is_owned_now = !mi_tf_is_owned(tf_old);
-  if (is_owned_now) {
-    mi_assert_internal(mi_page_is_abandoned(page));
-    mi_free_try_collect_mt(page,block);
+  if (allow_collect) {
+    const bool is_owned_now = !mi_tf_is_owned(tf_old);
+    if (is_owned_now) {
+      mi_assert_internal(mi_page_is_abandoned(page));
+      mi_free_try_collect_mt(page,block);
+    }
   }
 }
 
 
 // Adjust a block that was allocated aligned, to the actual start of the block in the page.
 // note: this can be called from `mi_free_generic_mt` where a non-owning thread accesses the
-// `page_start` and `block_size` fields; however these are constant and the page won't be
+// `page_woffset` and `block_size` fields; however these are constant and the page won't be
 // deallocated (as the block we are freeing keeps it alive) and thus safe to read concurrently.
 mi_block_t* _mi_page_ptr_unalign(const mi_page_t* page, const void* p) {
   mi_assert_internal(page!=NULL && p!=NULL);
@@ -140,17 +148,17 @@ static void mi_decl_noinline mi_free_generic_local(mi_page_t* page, void* p) mi_
 }
 
 // free a pointer owned by another thread (page parameter comes first for better codegen)
-static void mi_decl_noinline mi_free_generic_mt(mi_page_t* page, void* p) mi_attr_noexcept {
+static void mi_decl_noinline mi_free_generic_mt(mi_page_t* page, void* p, bool allow_collect) mi_attr_noexcept {
   mi_assert_internal(p!=NULL && page != NULL);
   mi_block_t* const block = (mi_page_has_interior_pointers(page) ? _mi_page_ptr_unalign(page, p) : mi_validate_block_from_ptr(page,p));
   const bool was_guarded = mi_block_check_unguard(page, block, p);
-  mi_free_block_mt(page, block, was_guarded);
+  mi_free_block_mt(page, block, was_guarded, allow_collect);
 }
 
 // generic free (for runtime integration)
 void mi_decl_noinline _mi_free_generic(mi_page_t* page, bool is_local, void* p) mi_attr_noexcept {
   if (is_local) mi_free_generic_local(page,p);
-           else mi_free_generic_mt(page,p);
+           else mi_free_generic_mt(page,p,true);
 }
 
 
@@ -176,7 +184,7 @@ static inline mi_page_t* mi_validate_ptr_page(const void* p, const char* msg)
 
 // Free a block
 // Fast path written carefully to prevent register spilling on the stack
-static mi_decl_forceinline void mi_free_ex(void* p, size_t* usable, mi_page_t* page)  
+static mi_decl_forceinline void mi_free_ex(void* p, size_t* usable, mi_page_t* page, bool allow_collect)  
 {
   if mi_unlikely(page==NULL) return;  // page will be NULL if p==NULL
   mi_assert_internal(p!=NULL && page!=NULL);
@@ -196,22 +204,22 @@ static mi_decl_forceinline void mi_free_ex(void* p, size_t* usable, mi_page_t* p
   else if ((xtid & MI_PAGE_FLAG_MASK) == 0) {      // `tid != mi_page_thread_id(page) && mi_page_flags(page) == 0`
     // blocks are aligned (and not a full page); push on the thread_free list
     mi_block_t* const block = mi_validate_block_from_ptr(page,p);
-    mi_free_block_mt(page,block,false /* was_guarded */);
+    mi_free_block_mt(page,block,false /* was_guarded */, allow_collect);
   }
   else {
     // page is full or contains (inner) aligned blocks; use generic multi-thread path
-    mi_free_generic_mt(page, p);
+    mi_free_generic_mt(page, p, allow_collect);
   }
 }
 
 void mi_free(void* p) mi_attr_noexcept {
   mi_page_t* const page = mi_validate_ptr_page(p,"mi_free");  
-  mi_free_ex(p, NULL, page);
+  mi_free_ex(p, NULL, page, true);
 }
 
 void mi_ufree(void* p, size_t* usable) mi_attr_noexcept {
   mi_page_t* const page = mi_validate_ptr_page(p,"mi_ufree");  
-  mi_free_ex(p, usable, page);
+  mi_free_ex(p, usable, page, true);
 }
 
 void mi_free_small(void* p) mi_attr_noexcept {
@@ -228,13 +236,19 @@ void mi_free_small(void* p) mi_attr_noexcept {
     #else
       mi_page_t* const page = (mi_page_t*)_mi_align_down_ptr(p,MI_SMALL_PAGE_SIZE);
       mi_assert(page == mi_validate_ptr_page(p,"mi_free_small"));
-      mi_assert((void*)page == _mi_align_down_ptr(page->page_start,MI_SMALL_PAGE_SIZE));
+      mi_assert((void*)page == _mi_align_down_ptr(mi_page_start(page),MI_SMALL_PAGE_SIZE));
       mi_assert(page->block_size <= MI_SMALL_SIZE_MAX);  // note: not `MI_SMALL_MAX_OBJ_SIZE` as we need to match `mi_(heap_)malloc_small`
-      mi_free_ex(p, NULL, page);
+      mi_free_ex(p, NULL, page, true);
     #endif
   #else
   mi_free(p);
   #endif  
+}
+
+// Free a pointer that is potentially allocated in a different sub-process
+void _mi_free_subproc_safe(void* p) {
+  mi_page_t* const page = mi_validate_ptr_page(p,"_mi_free_subproc_safe");  
+  mi_free_ex(p, NULL, page, false);
 }
 
 
@@ -267,7 +281,7 @@ static bool mi_abandoned_page_try_reabandon_to_mapped(mi_page_t* page)
   return _mi_arenas_page_try_reabandon_to_mapped(page);
 }
 
-// Release ownership of a page. This may free or reabandond the page if other blocks are concurrently
+// Release ownership of a page. This may free or reabandoned the page if other blocks are concurrently
 // freed in the meantime. Returns `true` if the page was freed.
 // By passing the captured `expected_thread_free`, we can often avoid calling `mi_page_free_collect`.
 static void mi_abandoned_page_unown_from_free(mi_page_t* page, mi_block_t* expected_thread_free) {
@@ -313,16 +327,16 @@ static mi_decl_noinline bool mi_abandoned_page_try_reclaim(mi_page_t* page, long
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_is_abandoned(page));
   mi_assert_internal(!mi_page_all_free(page));
-  mi_assert_internal(page->block_size <= MI_SMALL_SIZE_MAX);
+  mi_assert_internal(page->block_size <= MI_MEDIUM_MAX_OBJ_SIZE);
   mi_assert_internal(reclaim_on_free >= 0);
-
+  
   // dont reclaim if we just have terminated this thread and we should
   // not reinitialize the theap for this thread. (can happen due to thread-local destructors for example -- issue #944)
   if (!_mi_thread_is_initialized()) return false;
 
   // get our theap 
   mi_theap_t* const theap = _mi_page_associated_theap_peek(page);
-  if (theap==NULL || !theap->allow_page_reclaim) return false;
+  if (theap==NULL || theap->tld==NULL || !theap->allow_page_reclaim) return false;  // see issue #1289
   
   // todo: cache `is_in_threadpool` and `exclusive_arena` directly in the theap for performance?
   // set max_reclaim limit
@@ -359,6 +373,8 @@ static void mi_decl_noinline mi_free_try_collect_mt(mi_page_t* page, mi_block_t*
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_is_abandoned(page));
   mi_assert_internal(mt_free != NULL);
+  // mi_assert_internal(_mi_subproc() == mi_page_subproc(page));  // never collect across subprocesses
+  
   // we own the page now, and it is safe to collect the thread atomic free list
   if (page->block_size <= MI_SMALL_SIZE_MAX) {
     // use the `_partly` version to avoid atomic operations since we already have the `mt_free` pointing into the thread free list
@@ -380,7 +396,7 @@ static void mi_decl_noinline mi_free_try_collect_mt(mi_page_t* page, mi_block_t*
 
   // try to: 1. free it, 2. reclaim it, or 3. reabandon it to be mapped
   if (mi_abandoned_page_try_free(page)) return;
-  if (page->block_size <= MI_SMALL_SIZE_MAX && reclaim_on_free >= 0) {  // early test for better codegen
+  if (page->block_size <= MI_MEDIUM_MAX_OBJ_SIZE && reclaim_on_free >= 0) {  // early test for better codegen
     if (mi_abandoned_page_try_reclaim(page, reclaim_on_free)) return;
   }
   if (mi_abandoned_page_try_reabandon_to_mapped(page)) return;
@@ -522,7 +538,7 @@ static bool mi_page_decode_padding(const mi_page_t* page, const mi_block_t* bloc
 
 // Return the exact usable size of a block.
 static size_t mi_page_usable_size_of(const mi_page_t* page, const mi_block_t* block, bool is_guarded) {
-  if (is_guarded) {
+  if mi_unlikely(is_guarded) {
     const size_t bsize = mi_page_block_size(page);
     return (bsize - _mi_os_page_size());
   }
@@ -555,9 +571,15 @@ void _mi_padding_shrink(const mi_page_t* page, const mi_block_t* block, const si
   mi_track_mem_noaccess(padding,sizeof(mi_padding_t));
 }
 #else
-static size_t mi_page_usable_size_of(const mi_page_t* page, const mi_block_t* block, bool is_guarded) {
-  MI_UNUSED(is_guarded); MI_UNUSED(block);
-  return mi_page_usable_block_size(page);
+static inline size_t mi_page_usable_size_of(const mi_page_t* page, const mi_block_t* block, bool is_guarded) {
+  MI_UNUSED(block);
+  if mi_unlikely(is_guarded) {
+    const size_t bsize = mi_page_block_size(page);
+    return (bsize - _mi_os_page_size());
+  }
+  else {
+    return mi_page_usable_block_size(page);
+  }
 }
 
 void _mi_padding_shrink(const mi_page_t* page, const mi_block_t* block, const size_t min_size) {
@@ -654,5 +676,18 @@ static void mi_block_unguard(mi_page_t* page, mi_block_t* block, void* p) {
   void* gpage = (uint8_t*)block + bsize - psize;
   mi_assert_internal(_mi_is_aligned(gpage, psize));
   _mi_os_unprotect(gpage, psize);
+}
+
+// unguard a whole page (called from `mi_heap_destroy`)
+void _mi_page_unguard_all(mi_page_t* page) {      
+  if mi_likely(!mi_page_has_interior_pointers(page)) return;
+  uint8_t* const start = mi_page_start(page);
+  const size_t psize = mi_page_committed(page);
+  _mi_os_unprotect(start,psize);  // unprotect all at once as we cannot know which blocks are guarded
+}
+#else
+void _mi_page_unguard_all(mi_page_t* page) {
+  MI_UNUSED(page);
+  // nothing to do 
 }
 #endif

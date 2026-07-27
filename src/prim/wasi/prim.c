@@ -13,6 +13,7 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include <stdio.h>   // fputs
 #include <stdlib.h>  // getenv
+#include <unistd.h>  // sbrk, sleep
 
 //---------------------------------------------
 // Initialize
@@ -42,8 +43,6 @@ int _mi_prim_free(void* addr, size_t size ) {
 //---------------------------------------------
 
 #if defined(MI_USE_SBRK)
-  #include <unistd.h>  // for sbrk
-
   static void* mi_memory_grow( size_t size ) {
     void* p = sbrk(size);
     if (p == (void*)(-1)) return NULL;
@@ -186,32 +185,38 @@ size_t _mi_prim_numa_node_count(void) {
 
 #include <time.h>
 
-#if defined(CLOCK_REALTIME) || defined(CLOCK_MONOTONIC)
-
-mi_msecs_t _mi_prim_clock_now(void) {
-  struct timespec t;
-  #ifdef CLOCK_MONOTONIC
-  clock_gettime(CLOCK_MONOTONIC, &t);
-  #else
-  clock_gettime(CLOCK_REALTIME, &t);
-  #endif
-  return ((mi_msecs_t)t.tv_sec * 1000) + ((mi_msecs_t)t.tv_nsec / 1000000);
-}
-
-#else
-
 // low resolution timer
-mi_msecs_t _mi_prim_clock_now(void) {
-  #if !defined(CLOCKS_PER_SEC) || (CLOCKS_PER_SEC == 1000) || (CLOCKS_PER_SEC == 0)
-  return (mi_msecs_t)clock();
-  #elif (CLOCKS_PER_SEC < 1000)
-  return (mi_msecs_t)clock() * (1000 / (mi_msecs_t)CLOCKS_PER_SEC);
+static mi_msecs_t mi_prim_clock_now_lowres(void) {
+  const int64_t ticks = (int64_t)clock();
+  #if !defined(CLOCKS_PER_SEC) 
+    return ticks;
   #else
-  return (mi_msecs_t)clock() / ((mi_msecs_t)CLOCKS_PER_SEC / 1000);
+    if (CLOCKS_PER_SEC <= 0 || CLOCKS_PER_SEC == 1000) {
+      return ticks;
+    }
+    else if (CLOCKS_PER_SEC > 0 && CLOCKS_PER_SEC < 1000) {
+      return ticks * (1000 / (mi_msecs_t)CLOCKS_PER_SEC);
+    }
+    else {
+      return ticks / ((mi_msecs_t)CLOCKS_PER_SEC / 1000);
+    }
   #endif
 }
 
-#endif
+mi_msecs_t _mi_prim_clock_now(void) {
+  #if defined(CLOCK_REALTIME) || defined(CLOCK_MONOTONIC)
+    #ifdef CLOCK_MONOTONIC
+    const clockid_t clockid = CLOCK_MONOTONIC;
+    #else
+    const clockid_t clockid = CLOCK_REALTIME;
+    #endif
+    struct timespec t;  
+    if (clock_gettime(clockid,&t) == 0) {
+      return ((mi_msecs_t)t.tv_sec * 1000) + ((mi_msecs_t)t.tv_nsec / 1000000L);
+    }
+  #endif  
+  return mi_prim_clock_now_lowres();  
+}
 
 
 //----------------------------------------------------------------
@@ -238,9 +243,9 @@ void _mi_prim_out_stderr( const char* msg ) {
 // Environment
 //----------------------------------------------------------------
 
-bool _mi_prim_getenv(const char* name, char* result, size_t result_size) {
+int _mi_prim_getenv(const char* name, char* result, size_t result_size) {
   // cannot call getenv() when still initializing the C runtime.
-  if (_mi_preloading()) return false;
+  if (_mi_preloading()) return -1;  // error, try again later
   const char* s = getenv(name);
   if (s == NULL) {
     // we check the upper case name too.
@@ -252,9 +257,9 @@ bool _mi_prim_getenv(const char* name, char* result, size_t result_size) {
     buf[len] = 0;
     s = getenv(buf);
   }
-  if (s == NULL || _mi_strnlen(s,result_size) >= result_size)  return false;
+  if (s == NULL || _mi_strnlen(s,result_size) >= result_size)  return 0; // not found
   _mi_strlcpy(result, s, result_size);
-  return true;
+  return 1; // found
 }
 
 
@@ -285,4 +290,8 @@ void _mi_prim_thread_associate_default_theap(mi_theap_t* theap) {
 
 bool _mi_prim_thread_is_in_threadpool(void) {
   return false;
+}
+
+void _mi_prim_thread_yield(void) {
+  sleep(0);
 }

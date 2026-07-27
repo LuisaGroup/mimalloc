@@ -1,5 +1,5 @@
 /* ----------------------------------------------------------------------------
-Copyright (c) 2024-2025, Microsoft Research, Daan Leijen
+Copyright (c) 2024-2026, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -9,7 +9,8 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MIMALLOC_STATS_H
 
 #include <mimalloc.h>
-#include <stdint.h>
+#include <string.h>   // memset
+#include <stdint.h>   // int64_t
 
 #define MI_STAT_VERSION   5  // increased on every backward incompatible change
 
@@ -44,7 +45,7 @@ typedef struct mi_stat_counter_s {
   MI_STAT_COUNTER(reset)                    /* reset bytes */ \
   MI_STAT_COUNTER(purged)                   /* purged bytes */ \
   MI_STAT_COUNT(page_committed)             /* committed memory inside pages */ \
-  MI_STAT_COUNT(pages_abandoned)            /* abandonded pages count */ \
+  MI_STAT_COUNT(pages_abandoned)            /* abandoned pages count */ \
   MI_STAT_COUNT(threads)                    /* number of threads */ \
   MI_STAT_COUNT(malloc_normal)              /* allocated bytes <= MI_LARGE_OBJ_SIZE_MAX */ \
   MI_STAT_COUNT(malloc_huge)                /* allocated bytes in huge pages */ \
@@ -117,14 +118,17 @@ typedef struct mi_stats_s
 #undef MI_STAT_COUNT
 #undef MI_STAT_COUNTER
 
-// helper
-#if __cplusplus
-#define MI_STATS_ZERO_INIT  { }     /* empty initializer to prevent running the constructor (with msvc) */
-#else
-#define MI_STATS_ZERO_INIT  { 0 }   /* C zero initialize */
-#endif
+// Initialization
+static inline void mi_stats_header_init(mi_stats_t* stats) {
+  stats->size = sizeof(*stats);
+  stats->version = MI_STAT_VERSION;
+}
+static inline void mi_stats_init(mi_stats_t* stats) {
+  memset(stats,0,sizeof(*stats));
+  mi_stats_header_init(stats);
+}
 
-#define mi_stats_t_decl(name)  mi_stats_t name = MI_STATS_ZERO_INIT; name.size = sizeof(mi_stats_t); name.version = MI_STAT_VERSION;
+#define mi_stats_t_decl(name)  mi_stats_t name; mi_stats_init(&name);
 
 // Exported definitions
 #ifdef __cplusplus

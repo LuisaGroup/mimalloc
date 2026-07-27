@@ -12,6 +12,7 @@ Concurrent bitmap that can set/reset sequences of bits atomically
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
 #include "mimalloc/bits.h"
+#include "mimalloc/prim.h"  // _mi_prim_thread_yield
 #include "bitmap.h"
 
 #ifndef MI_OPT_SIMD
@@ -108,7 +109,7 @@ static inline bool mi_bfield_atomic_clear(_Atomic(mi_bfield_t)*b, size_t idx, bo
 // Clear a bit but only when/once it is set. This is used by concurrent free's while
 // the page is abandoned and mapped. This can incure a busy wait :-( but it should
 // happen almost never (and is accounted for in the stats)
-static inline void mi_bfield_atomic_clear_once_set(_Atomic(mi_bfield_t)*b, size_t idx) {
+static inline void mi_bfield_atomic_clear_once_set(mi_subproc_t* subproc, _Atomic(mi_bfield_t)*b, size_t idx) {
   mi_assert_internal(idx < MI_BFIELD_BITS);
   const mi_bfield_t mask = mi_bfield_mask(1, idx);;
   mi_bfield_t old = mi_atomic_load_relaxed(b);
@@ -116,10 +117,10 @@ static inline void mi_bfield_atomic_clear_once_set(_Atomic(mi_bfield_t)*b, size_
     if mi_unlikely((old&mask) == 0) {
       old = mi_atomic_load_acquire(b);
       if ((old&mask)==0) {
-        mi_subproc_stat_counter_increase(_mi_subproc(), pages_unabandon_busy_wait, 1);
+        mi_subproc_stat_counter_increase(subproc, pages_unabandon_busy_wait, 1);
       }
       while ((old&mask)==0) { // busy wait
-        mi_atomic_yield();
+        _mi_prim_thread_yield(); 
         old = mi_atomic_load_acquire(b);
       }
     }
@@ -368,7 +369,7 @@ static inline bool mi_bchunk_clearN(mi_bchunk_t* chunk, size_t cidx, size_t n, b
   if (n==1) return mi_bchunk_clear(chunk, cidx, maybe_all_clear);
   // if (n==8) return mi_bchunk_clear8(chunk, cidx, maybe_all_clear);
   // if (n==MI_BFIELD_BITS) return mi_bchunk_clearX(chunk, cidx, maybe_all_clear);
-  // TODO: implement mi_bchunk_xsetNX instead of setNX
+  // todo: implement mi_bchunk_xsetNX instead of setNX
   return mi_bchunk_xsetNC(MI_BIT_CLEAR, chunk, cidx, n, NULL, maybe_all_clear);
 }
 
@@ -887,11 +888,11 @@ static mi_decl_noinline bool mi_bchunk_try_find_and_clearNC(mi_bchunk_t* chunk, 
 
 // ------- mi_bchunk_clear_once_set ---------------------------------------
 
-static inline void mi_bchunk_clear_once_set(mi_bchunk_t* chunk, size_t cidx) {
+static inline void mi_bchunk_clear_once_set(mi_subproc_t* subproc, mi_bchunk_t* chunk, size_t cidx) {
   mi_assert_internal(cidx < MI_BCHUNK_BITS);
   const size_t i = cidx / MI_BFIELD_BITS;
   const size_t idx = cidx % MI_BFIELD_BITS;
-  mi_bfield_atomic_clear_once_set(&chunk->bfields[i], idx);
+  mi_bfield_atomic_clear_once_set(subproc, &chunk->bfields[i], idx);
 }
 
 
@@ -1072,7 +1073,6 @@ static void mi_bchunks_unsafe_setN(mi_bchunk_t* chunks, mi_bchunkmap_t* cmap, si
   // last chunk
   if (n > 0) {
     mi_assert_internal(n < MI_BCHUNK_BITS);
-    mi_assert_internal(chunk_idx < MI_BCHUNK_FIELDS);
     mi_bchunk_setN(&chunks[chunk_idx], 0, n, NULL);
   }
 }
@@ -1355,12 +1355,15 @@ bool mi_bitmap_bsr(mi_bitmap_t* bitmap, size_t* idx) {
     mi_bfield_t cmap = mi_atomic_load_relaxed(&bitmap->chunkmap.bfields[i]);
     size_t cmap_idx;
     if (mi_bsr(cmap,&cmap_idx)) {
-      // highest chunk
-      const size_t chunk_idx = i*MI_BFIELD_BITS + cmap_idx;
-      size_t cidx;
-      if (mi_bchunk_bsr(&bitmap->chunks[chunk_idx], &cidx)) {
-        *idx = (chunk_idx * MI_BCHUNK_BITS) + cidx;
-        return true;
+      // from highest chunk to lowest (scan all in case the cmap entry was stale)
+      for (size_t j = cmap_idx+1; j>0; ) {
+        j--;
+        const size_t chunk_idx = (i*MI_BFIELD_BITS) + j;
+        size_t cidx;
+        if (mi_bchunk_bsr(&bitmap->chunks[chunk_idx], &cidx)) {
+          *idx = (chunk_idx * MI_BCHUNK_BITS) + cidx;
+          return true;
+        }
       }
     }
   }
@@ -1388,12 +1391,12 @@ size_t mi_bitmap_popcount(mi_bitmap_t* bitmap) {
 
 
 // Clear a bit once it is set.
-void mi_bitmap_clear_once_set(mi_bitmap_t* bitmap, size_t idx) {
+void mi_bitmap_clear_once_set(mi_subproc_t* subproc, mi_bitmap_t* bitmap, size_t idx) {
   mi_assert_internal(idx < mi_bitmap_max_bits(bitmap));
   const size_t chunk_idx = idx / MI_BCHUNK_BITS;
   const size_t cidx = idx % MI_BCHUNK_BITS;
   mi_assert_internal(chunk_idx < mi_bitmap_chunk_count(bitmap));
-  mi_bchunk_clear_once_set(&bitmap->chunks[chunk_idx], cidx);
+  mi_bchunk_clear_once_set(subproc, &bitmap->chunks[chunk_idx], cidx);
 }
 
 
@@ -1442,21 +1445,27 @@ bool _mi_bitmap_forall_setc_ranges(mi_bitmap_t* bitmap, mi_forall_set_fun_t* vis
       for (size_t j = 0; j < MI_BCHUNK_FIELDS; j++) {
         const size_t base_idx = (chunk_idx*MI_BCHUNK_BITS) + (j*MI_BFIELD_BITS);
         mi_bfield_t b = mi_atomic_exchange_relaxed(&chunk->bfields[j], (mi_bfield_t)0);
-#if MI_DEBUG > 1
+        #if MI_DEBUG > 1
         const size_t bpopcount = mi_popcount(b);
         size_t rngcount = 0;
-#endif
+        #endif
         size_t bidx;
         while (mi_bfield_find_least_bit(b, &bidx)) {
           size_t rng = mi_ctz(~(b>>bidx)); // all the set bits from bidx
-#if MI_DEBUG > 1
+          #if MI_DEBUG > 1
           rngcount += rng;
-#endif
+          #endif
           const size_t idx = base_idx + bidx;
           mi_assert_internal(rng>=1 && rng<=MI_BFIELD_BITS);
           mi_assert_internal((idx % MI_BFIELD_BITS) + rng <= MI_BFIELD_BITS);
           mi_assert_internal((idx / MI_BCHUNK_BITS) < mi_bitmap_chunk_count(bitmap));
-          if (!visit(idx, rng, arena, arg)) return false;
+          if (!visit(idx, rng, arena, arg)) {
+            // break early: reset the non-visited bits
+            if (b!=0) {
+              mi_atomic_or_relaxed(&chunk->bfields[j], b);
+            }
+            return false;
+          }
           // clear rng bits in b
           b = b & ~mi_bfield_mask(rng, bidx);
         }
@@ -1501,11 +1510,16 @@ bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_fo
           if ((b & rngmask) == rngmask) {
             const size_t idx = base_idx + shift;
             if (!visit(idx, rngslices, arena, arg)) {
-              // break early
-              if (skipped != 0) {
-                mi_atomic_or_relaxed(&chunk->bfields[j], skipped);
-                return false;
+              // break early: restore non-visited entries
+              mi_bfield_t notyet_visited = 0;
+              if (shift + rngslices < MI_BFIELD_BITS) {
+                notyet_visited = (b & (~(mi_bfield_t)0 << (shift + rngslices)));
               }
+              mi_assert_internal((notyet_visited & skipped) == 0);
+              if ((notyet_visited | skipped) != 0) {
+                mi_atomic_or_relaxed(&chunk->bfields[j], notyet_visited | skipped);
+              }
+              return false;
             }
           }
           else {
@@ -1543,7 +1557,7 @@ size_t mi_bbitmap_size(size_t bit_count, size_t* pchunk_count) {
 
 // initialize a bitmap to all unset; avoid a mem_zero if `already_zero` is true
 // returns the size of the bitmap
-size_t mi_bbitmap_init(mi_bbitmap_t* bbitmap, size_t bit_count, bool already_zero) {
+size_t mi_bbitmap_init(mi_subproc_t* subproc, mi_bbitmap_t* bbitmap, size_t bit_count, bool already_zero) {
   size_t chunk_count;
   const size_t size = mi_bbitmap_size(bit_count, &chunk_count);
   if (!already_zero) {
@@ -1551,6 +1565,7 @@ size_t mi_bbitmap_init(mi_bbitmap_t* bbitmap, size_t bit_count, bool already_zer
   }
   mi_atomic_store_release(&bbitmap->chunk_count, chunk_count);
   mi_assert_internal(mi_atomic_load_relaxed(&bbitmap->chunk_count) <= MI_BITMAP_MAX_CHUNK_COUNT);
+  bbitmap->subproc = subproc;
   return size;
 }
 
@@ -1561,19 +1576,15 @@ void mi_bbitmap_unsafe_setN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
 }
 
 bool mi_bbitmap_bsr_inv(mi_bbitmap_t* bbitmap, size_t* idx) {
-  const size_t chunkmap_max = _mi_divide_up(mi_bbitmap_chunk_count(bbitmap), MI_BFIELD_BITS);
-  for (size_t i = chunkmap_max; i > 0; ) {
+  // scan for highest zero bit in the bitmap
+  // note: we cannot use the chunkmap since that only conservatively denotes if there might be a set bit in a chuck
+  const size_t chunk_count = mi_bbitmap_chunk_count(bbitmap);
+  for(size_t i = chunk_count; i > 0; ) {
     i--;
-    mi_bfield_t cmap = mi_atomic_load_relaxed(&bbitmap->chunkmap.bfields[i]);
-    size_t cmap_idx;
-    if (mi_bsr(~cmap, &cmap_idx)) {
-      // highest chunk
-      const size_t chunk_idx = i*MI_BFIELD_BITS + cmap_idx;
-      size_t cidx;
-      if (mi_bchunk_bsr_inv(&bbitmap->chunks[chunk_idx], &cidx)) {
-        *idx = (chunk_idx * MI_BCHUNK_BITS) + cidx;
-        return true;
-      }
+    size_t cidx;
+    if (mi_bchunk_bsr_inv(&bbitmap->chunks[i], &cidx)) {
+      *idx = (i * MI_BCHUNK_BITS) + cidx;
+      return true;
     }
   }
   return false;
@@ -1590,11 +1601,11 @@ static void mi_bbitmap_set_chunk_bin(mi_bbitmap_t* bbitmap, size_t chunk_idx, mi
   for (mi_chunkbin_t ibin = MI_CBIN_SMALL; ibin < MI_CBIN_NONE; ibin = mi_chunkbin_inc(ibin)) {
     if (ibin == bin) {
       const bool was_clear = mi_bchunk_set(& bbitmap->chunkmap_bins[ibin], chunk_idx, NULL);
-      if (was_clear) { mi_os_stat_increase(chunk_bins[ibin],1); }
+      if (was_clear) { mi_subproc_stat_increase(bbitmap->subproc, chunk_bins[ibin],1); }
     }
     else {
       const bool was_set = mi_bchunk_clear(&bbitmap->chunkmap_bins[ibin], chunk_idx, NULL);
-      if (was_set) { mi_os_stat_decrease(chunk_bins[ibin],1); }
+      if (was_set) { mi_subproc_stat_decrease(bbitmap->subproc,chunk_bins[ibin],1); }
     }
   }
 }
