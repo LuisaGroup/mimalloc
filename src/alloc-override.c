@@ -9,6 +9,21 @@ terms of the MIT license. A copy of the license can be found in the file
 #error "this file should be included from 'alloc.c' (so aliases can work)"
 #endif
 
+// ------------------------------------------------------
+// Defined here instead of alloc-posix.c so they can be aliased below,
+// but outside of MI_MALLOC_OVERRIDE as they are part of the API.
+// ------------------------------------------------------
+
+mi_decl_nodiscard size_t mi_malloc_size(const void* p) mi_attr_noexcept {
+  if (!mi_any_heap_contains(p)) return 0;
+  return mi_usable_size(p);
+}
+
+mi_decl_nodiscard size_t mi_malloc_usable_size(const void *p) mi_attr_noexcept {
+  if (!mi_any_heap_contains(p)) return 0;
+  return mi_usable_size(p);
+}
+
 
 #if defined(MI_MALLOC_OVERRIDE) && !defined(_DLL)
 
@@ -225,7 +240,8 @@ typedef void* mi_nothrow_t;
   #endif
 #endif
 
-#if (defined(__GNUC__) || defined(__clang__)) && !defined(__APPLE__)
+// on macOS export the C++ operators too: interposing them does not work, but as weak definitions an exported one wins.
+#if (defined(__GNUC__) || defined(__clang__))
 #pragma GCC visibility push(default)
 #endif
 
@@ -324,17 +340,6 @@ typedef void* mi_nothrow_t;
 extern "C" {
 #endif
 
-// defined here instead alloc-posix so we can alias it
-mi_decl_nodiscard size_t mi_malloc_size(const void* p) mi_attr_noexcept {
-  if (!mi_is_in_heap_region(p)) return 0;
-  return mi_usable_size(p);
-}
-
-mi_decl_nodiscard size_t mi_malloc_usable_size(const void *p) mi_attr_noexcept {
-  if (!mi_is_in_heap_region(p)) return 0;
-  return mi_usable_size(p);
-}
-
 #ifndef MI_OSX_IS_INTERPOSED
   // Forward Posix/Unix calls as well
   void*  reallocf(void* p, size_t newsize) MI_FORWARD2(mi_reallocf,p,newsize)
@@ -400,7 +405,7 @@ mi_decl_weak int reallocarr(void* p, size_t count, size_t size)    { return mi_r
 }
 #endif
 
-#if (defined(__GNUC__) || defined(__clang__)) && !defined(__APPLE__)
+#if (defined(__GNUC__) || defined(__clang__))
 #pragma GCC visibility pop
 #endif
 

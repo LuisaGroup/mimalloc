@@ -455,24 +455,21 @@ static size_t mi_arena_start_idx(mi_heap_t* heap, size_t tseq, size_t arena_cycl
   const size_t _arena_count = mi_arenas_get_count(heap->subproc); \
   const size_t _arena_cycle = (_arena_count == 0 ? 0 : _arena_count - 1); /* first search the arenas below the last one */ \
   /* always start searching in the arena's below the max */ \
-  const size_t _start = mi_arena_start_idx(heap,tseq,_arena_cycle); \
+  const size_t _start = (req_arena==NULL ? mi_arena_start_idx(heap,tseq,_arena_cycle) : ((mi_arena_t*)req_arena)->arena_idx); \
+  mi_assert_internal(_start <= _arena_count); \
   for (size_t _i = 0; _i < _arena_count; _i++) { \
     mi_arena_t* name_arena; \
-    if (req_arena != NULL) { \
-      name_arena = req_arena; /* if there is a specific req_arena, only search that one */\
-      if (_i > 0) break;      /* only once */ \
+    size_t _idx; \
+    if (_i < _arena_cycle) { \
+      _idx = _i + _start; \
+      if (_idx >= _arena_cycle) { _idx -= _arena_cycle; } /* adjust so we rotate through the cycle */ \
     } \
     else { \
-      size_t _idx; \
-      if (_i < _arena_cycle) { \
-        _idx = _i + _start; \
-        if (_idx >= _arena_cycle) { _idx -= _arena_cycle; } /* adjust so we rotate through the cycle */ \
-      } \
-      else { \
-        _idx = _i; /* remaining arena's after the cycle */ \
-      } \
-      name_arena = mi_arena_from_index(heap->subproc,_idx); \
+      _idx = _i; /* remaining arena's after the cycle */ \
     } \
+    name_arena = mi_arena_from_index(heap->subproc,_idx); \
+    if (req_arena != NULL && name_arena != req_arena && \
+        (name_arena == NULL || name_arena->parent != req_arena)) continue; /* only the requested arena or its children */ \
     if (name_arena != NULL) \
     {
 
@@ -2317,7 +2314,7 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
   if (arena->memid.is_pinned || delay < 0 || _mi_preloading()) return;  // is purging allowed at all?
 
   mi_assert_internal(mi_bbitmap_is_clearN(arena->slices_free, slice_index, slice_count));
-  if (delay == 0) {
+  if (delay == 0 || mi_size_of_slices(slice_count) >= mi_option_get_size(mi_option_arena_purge_immediate_size)) {
     // purge directly
     mi_arena_purge(arena, slice_index, slice_count);
   }
@@ -2461,6 +2458,10 @@ static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subpro
   }
 }
 
+void mi_arenas_purge(void) mi_attr_noexcept {
+  mi_arenas_try_purge(true, true, _mi_subproc_main(), 0);
+}
+
 
 /* -----------------------------------------------------------
   Visit all pages and blocks in a heap
@@ -2580,6 +2581,7 @@ static bool mi_heap_delete_page(const mi_heap_t* heap, const mi_heap_area_t* are
     _mi_page_unguard_all(page);          // remove potential interior guard pages 
     #endif
     // destroy the page
+    _mi_page_free_collect(page, false); // collect the thread-free list first while `used` still counts those blocks (as `_mi_arenas_page_free` collects it again) (see #1420)
     mi_page_used_reset(page);           // note: invariant `|local_free| + |free| == reserved - used`  does not hold in this case
     _mi_arenas_page_free(page, theap);
   }
