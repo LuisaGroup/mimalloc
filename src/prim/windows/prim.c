@@ -821,7 +821,17 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
     return ((imageNtHeaders->FileHeader.Characteristics & IMAGE_FILE_DLL) == IMAGE_FILE_DLL);
   }
 
-  mi_decl_externc IMAGE_DOS_HEADER __ImageBase;   // supplied by the linker
+  // `__ImageBase` is a linker-provided ABSOLUTE symbol equal to the module
+  // base image address (RVA 0). It must be *declared* (never defined) here.
+  // When this translation unit is compiled as C, `mi_decl_externc` expands to
+  // nothing, so a bare `IMAGE_DOS_HEADER __ImageBase;` would become a
+  // tentative definition and allocate a real `<common>` data symbol that
+  // shadows the linker symbol. That corrupts the CRT `memset`/`memcpy`
+  // dispatch tables (which are `__ImageBase`-relative), so the first
+  // `memset(&si,0,sizeof(SYSTEM_INFO))` during mimalloc's loader-time TLS
+  // callback jumps through a bad base and faults inside `LoadLibrary`. Add an
+  // explicit `extern` so this stays a declaration in both C and C++.
+  mi_decl_externc extern IMAGE_DOS_HEADER __ImageBase;   // supplied by the linker
 
   static bool mi_current_module_is_dll(void) {
     // HMODULE mod = NULL;
