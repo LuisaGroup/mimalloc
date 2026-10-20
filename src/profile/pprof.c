@@ -23,9 +23,11 @@ format generation).
 // ---------------------------------------------------------------------------
 
 #include "mimalloc.h"
-#include "mimalloc/internal.h"
-#include "mimalloc/prim-tls.h"   // _mi_theap_default
-#include "mimalloc-profile.h"
+#include "mimalloc/prim/prim-tls.h"   // _mi_theap_default
+#include "mimalloc/util/libc.h"
+#include "mimalloc/util/options.h"
+#include "mimalloc/util/stats.h"
+#include "mimalloc/profile/pprof.h"
 
 // ---------------------------------------------------------------------------
 // Internal API
@@ -125,7 +127,7 @@ static size_t  mi_prim_backtrace(void** buffer, size_t max_depth, size_t* hash);
 static bool mi_is_elevated_process(void);
 static mi_profiler_t* mi_profile_env_profiler;  // NULL if `MIMALLOC_PROFILE` was not set (or initialization failed)
 
-// Called once at process initialization (see `mi_process_init` in `init.c`).
+// Called once at process initialization (see `mi_process_init` in `heap/init.c`).
 void _mi_pprof_profiler_init(void) {
   #if MI_PROFILE
   if (mi_is_elevated_process()) return;  // don't let an untrusted environment influence a privileged process
@@ -144,7 +146,7 @@ void _mi_pprof_profiler_init(void) {
   #endif
 }
 
-// Called once at process termination (see `mi_process_done` in `init.c`).
+// Called once at process termination (see `mi_process_done` in `heap/init.c`).
 void _mi_pprof_profiler_done(void) {
   #if MI_PROFILE
   mi_profiler_t* profiler = mi_profile_env_profiler;
@@ -468,7 +470,7 @@ static void mi_locations_done(mi_heap_t* heap, mi_locations_t* locations) {
 static bool mi_location_matches(const mi_location_t* loc, size_t hash, mi_threadid_t thread_id, const mi_callstack_t* callstack) {
   return (loc->hash == hash && loc->thread_id == thread_id &&
           loc->callstack.count == callstack->count &&
-          (callstack->count == 0 || _mi_memcmp(loc->callstack.frames, callstack->frames, callstack->count * sizeof(void*)) == 0));
+          (callstack->count == 0 || mi_memcmp(loc->callstack.frames, callstack->frames, callstack->count * sizeof(void*)) == 0));
 }
 
 // Find an existing location matching `thread_id` and `callstack`, or insert
@@ -498,7 +500,7 @@ static mi_location_t* mi_locations_find_or_insert(mi_heap_t* heap, mi_locations_
   if (callstack->count > 0) {
     loc->callstack.frames = (void**)mi_heap_mallocn(heap, callstack->count, sizeof(void*));
     if (loc->callstack.frames == NULL) return NULL;
-    _mi_memcpy(loc->callstack.frames, callstack->frames, callstack->count * sizeof(void*));
+    mi_memcpy(loc->callstack.frames, callstack->frames, callstack->count * sizeof(void*));
   }
   loc->callstack.count = callstack->count;
   loc->thread_id = thread_id;
@@ -754,7 +756,7 @@ static void mi_pprof_modules_done(mi_pprof_modules_t* mods) {
 // sites can use its `%l8x`/`%l8d`/`%tx` extensions instead of <inttypes.h>'s
 // `PRIx64`/`PRIu64`/`PRIxPTR` macros) and writes the result directly to a `FILE*`.
 // (Distinct from the existing `_mi_fprintf(mi_output_fun*, void*, ...)`  in
-// `options.c`, which targets mimalloc's redirectable output callback instead
+// `util/options.c`, which targets mimalloc's redirectable output callback instead
 // of an arbitrary `FILE*`.)
 static void mi_fprintf(FILE* f, const char* fmt, ...) {
   char buf[512];

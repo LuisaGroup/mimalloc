@@ -11,7 +11,7 @@ terms of the MIT license. A copy of the license can be found in the file
 /*
 Testing allocators is difficult as bugs may only surface after particular
 allocation patterns. The main approach to testing _mimalloc_ is therefore
-to have extensive internal invariant checking (see `page_is_valid` in `page.c`
+to have extensive internal invariant checking (see `page_is_valid` in `alloc/page.c`
 for example), which is enabled in debug mode with `-DMI_DEBUG_FULL=ON`.
 The main testing is then to run `mimalloc-bench` [1] using full invariant checking
 to catch any potential problems over a wide range of intensive allocation bench
@@ -29,6 +29,7 @@ we therefore test the API over various inputs. Please add more tests :-)
 #include <errno.h>
 
 #ifdef __cplusplus
+#include <new>
 #include <vector>
 #endif
 
@@ -55,10 +56,17 @@ bool test_stl_theap_allocator3(void);
 bool test_stl_theap_allocator4(void);
 
 static bool test_zero_aligned_first(void);
+static bool test_aligned_all(void);
 static bool test_heap_destroy_xthread_free(void);
 static bool test_heap_destroy_stale_theap(void);
 #ifdef __cplusplus
 static bool test_new_first(void);
+#endif
+
+#if !MI_QSBR
+static void mi_cdecl qsbr_record_error(int err, void* arg) {
+  *(int*)arg = err;
+}
 #endif
 
 static bool mem_has_vals(const uint8_t* p, size_t size, uint8_t val) {
@@ -329,6 +337,9 @@ int main(void) {
     }
     result = ok;
   }
+  CHECK_BODY("mimalloc-aligned15") {
+    result = test_aligned_all();
+  }
   CHECK_BODY("malloc-aligned-at1") {
     void* p = mi_malloc_aligned_at(48,32,0); result = (p != NULL && ((uintptr_t)(p) + 0) % 32 == 0); mi_free(p);
   };
@@ -392,6 +403,17 @@ int main(void) {
     mi_free(ptr);
   }
 
+  #if !MI_QSBR
+  CHECK_BODY("heap-qsbr-unavailable") {
+    int err = 0;
+    mi_register_error(&qsbr_record_error, &err);
+    mi_heap_t* heap = mi_heap_new_qsbr();
+    mi_register_error(NULL, NULL);
+    result = (heap == NULL && err == ENOSYS);
+    if (heap != NULL) { mi_heap_destroy(heap); }
+  }
+  #endif
+
   CHECK_BODY("heap_aligned1") {
     mi_heap_t* heap = mi_heap_new();
     const size_t alignment = 128 * 1024;  // 128 KiB
@@ -432,6 +454,51 @@ int main(void) {
     void* p = mi_reallocarray(NULL,0,16);  // issue #574
     result = (p != NULL && errno == 0);
     mi_free(p);
+  };
+
+  CHECK_BODY("reallocarray-overflow") {
+    uint8_t* p = (uint8_t*)mi_malloc(32);
+    if (p == NULL) { result = false; }
+    else {
+      memset(p, 0x5A, 32);
+      errno = 0;
+      void* q = mi_reallocarray(p, SIZE_MAX / 2 + 1, 2);
+      result = (q == NULL && errno == EOVERFLOW && mem_has_vals(p, 32, 0x5A));
+      mi_free(q == NULL ? p : q);
+    }
+  };
+
+  CHECK_BODY("reallocarr-grow") {
+    void* p = mi_malloc(32);
+    if (p == NULL) { result = false; }
+    else {
+      memset(p, 0x5A, 32);
+      int err = mi_reallocarr(&p, 64, 2);
+      result = (err == 0 && mi_usable_size(p) >= 128 && mem_has_vals((uint8_t*)p, 32, 0x5A));
+      mi_free(p);
+    }
+  };
+
+  CHECK_BODY("reallocarr-zero-count") {
+    void* p = mi_malloc(32);
+    if (p == NULL) { result = false; }
+    else {
+      int err = mi_reallocarr(&p, 0, 2);
+      result = (err == 0 && p == NULL);
+      mi_free(p);
+    }
+  };
+
+  CHECK_BODY("reallocarr-overflow") {
+    void* p = mi_malloc(32);
+    if (p == NULL) { result = false; }
+    else {
+      memset(p, 0x5A, 32);
+      void* original = p;
+      int err = mi_reallocarr(&p, SIZE_MAX / 2 + 1, 2);
+      result = (err == EOVERFLOW && p == original && mem_has_vals((uint8_t*)p, 32, 0x5A));
+      mi_free(original);
+    }
   };
 
   CHECK_BODY("realloc-guarded") {      // issue #1304
@@ -609,6 +676,21 @@ int main(void) {
     if (!result) {
       fprintf(stderr, "heap-os2: pages: %ld != %ld (failed: %ld)\n", (long)stats0.pages.current, (long)stats1.pages.current, failed);
     }
+  }
+
+  CHECK_BODY("heap-destroy-os-pages") {   // regular OS-backed owned pages must not be orphaned on heap destroy
+    mi_collect(true);
+    mi_stats_t_decl(stats0);
+    mi_stats_get(&stats0);
+    mi_option_set(mi_option_disallow_arena_alloc, 1);   // force all pages to be OS allocated
+    mi_heap_t* h = mi_heap_new();
+    for (int i = 0; i < 1000; i++) { (void)mi_heap_malloc(h, 48); }  // owned OS-backed pages with live blocks
+    mi_heap_destroy(h);
+    mi_option_set(mi_option_disallow_arena_alloc, 0);
+    mi_collect(true);
+    mi_stats_t_decl(stats1);
+    mi_stats_get(&stats1);
+    result = (stats0.pages.current == stats1.pages.current);  // orphaned if destroy missed the owned OS pages
   }
 
   #define NHEAPS (1000)
@@ -824,6 +906,43 @@ static bool test_zero_aligned_first(void) {
   res = res && (p != NULL && (uintptr_t)(p) % 32 == 0);
   mi_free(p);
   return res;
+}
+
+
+// ---------------------------------------------------------------------------
+// Aligned allocation for all size classes and alignments up to 4KiB (including huge blocks).
+// Keeps several blocks live so alignment is checked beyond the first block in a page.
+// ---------------------------------------------------------------------------
+
+static bool test_aligned_check(size_t size, size_t align, bool zero) {
+  void* p[8];
+  bool ok = true;
+  for (int i = 0; i < 8; i++) {
+    p[i] = (zero ? mi_zalloc_aligned(size, align) : mi_malloc_aligned(size, align));
+    if (p[i] == NULL || ((uintptr_t)p[i] % align) != 0 || mi_usable_size(p[i]) < size || (zero && !mem_is_zero(p[i], size))) {
+      ok = false;
+    }
+    if (p[i] != NULL) { memset(p[i], 0xAB, size); }
+  }
+  for (int i = 0; i < 8; i++) {
+    mi_free(p[i]);
+  }
+  return ok;
+}
+
+static bool test_aligned_all(void) {
+  bool ok = true;
+  for (size_t size = 0; size <= 300*1024 && ok; size += (size < 16*1024 ? 8 : 512)) {
+    for (size_t align = 8; align <= 4096 && ok; align *= 2) {
+      ok = test_aligned_check(size, align, ((size/8) & 1) != 0);
+    }
+  }
+  for (size_t size = 4*1024*1024 - 4096; size <= 4*1024*1024 + 3*4096 && ok; size += 1024) {
+    for (size_t align = 8; align <= 4096 && ok; align *= 2) {
+      ok = test_aligned_check(size, align, false);
+    }
+  }
+  return ok;
 }
 
 

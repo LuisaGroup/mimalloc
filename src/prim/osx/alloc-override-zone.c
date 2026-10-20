@@ -6,8 +6,7 @@ terms of the MIT license. A copy of the license can be found in the file
 -----------------------------------------------------------------------------*/
 
 #include "mimalloc.h"
-#include "mimalloc/internal.h"
-#include "mimalloc/prim-tls.h"  // _mi_thread_is_initialized
+#include "mimalloc/prim/os.h"
 #if defined(MI_MALLOC_OVERRIDE)
 
 #if !defined(__APPLE__)
@@ -25,7 +24,6 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include <AvailabilityMacros.h>
 #include <malloc/malloc.h>
-#include <string.h>  // memset
 #include <stdlib.h>
 
 #ifdef __cplusplus
@@ -282,7 +280,7 @@ static bool is_mimalloc_zone( malloc_zone_t* zone ) {
 // our mimalloc zone. Since even the loader uses malloc
 // on macOS, this ensures that all allocations go through
 // mimalloc (as all calls are interposed).
-// The main `malloc`, `free`, etc calls are interposed in `alloc-override.c`,
+// The main `malloc`, `free`, etc calls are interposed in `alloc/alloc-override.c`,
 // Here, we also override macOS specific API's like
 // `malloc_zone_calloc` etc. see <https://github.com/aosm/libmalloc/blob/master/man/malloc_zone_malloc.3>
 // ------------------------------------------------------
@@ -384,16 +382,9 @@ static void zone_unregister(malloc_zone_t* zone) {
 
 // use interposing so `DYLD_INSERT_LIBRARIES` works without `DYLD_FORCE_FLAT_NAMESPACE=1`
 // See: <https://books.google.com/books?id=K8vUkpOXhN4C&pg=PA73>
-struct mi_interpose_s {
-  const void* replacement;
-  const void* target;
-};
-#define MI_INTERPOSE_FUN(oldfun,newfun) { (const void*)&newfun, (const void*)&oldfun }
-#define MI_INTERPOSE_MI(fun)            MI_INTERPOSE_FUN(fun,mi_##fun)
 #define MI_INTERPOSE_ZONE(fun)          MI_INTERPOSE_FUN(malloc_##fun,fun)
-__attribute__((used)) static const struct mi_interpose_s _mi_zone_interposes[]  __attribute__((section("__DATA, __interpose"))) =
+MI_INTERPOSE_DECLS(_mi_zone_interposes) = 
 {
-
   MI_INTERPOSE_MI(malloc_create_zone),
   MI_INTERPOSE_MI(malloc_default_purgeable_zone),
   MI_INTERPOSE_MI(malloc_default_zone),

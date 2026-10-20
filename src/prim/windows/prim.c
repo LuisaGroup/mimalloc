@@ -8,8 +8,11 @@ terms of the MIT license. A copy of the license can be found in the file
 // This file is included in `src/prim/prim.c`
 
 #include "mimalloc.h"
-#include "mimalloc/internal.h"
 #include "mimalloc/prim.h"
+#include "mimalloc/prim/os.h"
+#include "mimalloc/util/libc.h"
+#include "mimalloc/util/options.h"
+#include "mimalloc/heap/init.h"
 #include <stdio.h>   // fputs, stderr
 #include <stdlib.h>  // atexit
 
@@ -90,19 +93,19 @@ typedef BOOL (__stdcall* PGetVersionExW)(LPOSVERSIONINFOW lpVersionInformation);
 
 
 // Load a library
-static HMODULE mi_win_loadlibrary(const TCHAR* library) {
+static HMODULE mi_win_loadlibrary(const wchar_t* library) {
   #if MI_WIN_DESKTOP
-    return LoadLibrary(library);
+    return LoadLibraryW(library);
   #else
     return LoadPackagedLibrary(library, 0);
   #endif
 }
 
 // Get a library handle (and possibly load it)
-static HMODULE mi_win_getlibrary(const TCHAR* library, bool* should_free) {
+static HMODULE mi_win_getlibrary(const wchar_t* library, bool* should_free) {
   #if MI_WIN_DESKTOP
   // avoid calling LoadLibrary for "kernel32", "ntdll", and "kernelbase" (also to avoid hitting the loader lock)
-  HMODULE mod = GetModuleHandle(library);
+  HMODULE mod = GetModuleHandleW(library);
   if (mod!=NULL) {
     *should_free = false;
     return mod;
@@ -197,7 +200,7 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config )
 
   // get the VirtualAlloc2 function
   bool hDllFree;
-  HINSTANCE hDll = mi_win_getlibrary(TEXT("kernelbase.dll"), &hDllFree);
+  HINSTANCE hDll = mi_win_getlibrary(L"kernelbase.dll", &hDllFree);
   if (hDll != NULL) {
     // use VirtualAlloc2FromApp if possible as it is available to Windows store apps
     pVirtualAlloc2 = (PVirtualAlloc2)(void (*)(void))GetProcAddress(hDll, "VirtualAlloc2FromApp");
@@ -205,14 +208,14 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config )
     mi_win_freelibrary(hDll, hDllFree);
   }
   // NtAllocateVirtualMemoryEx is used for huge page allocation
-  hDll = mi_win_getlibrary(TEXT("ntdll.dll"), &hDllFree);
+  hDll = mi_win_getlibrary(L"ntdll.dll", &hDllFree);
   if (hDll != NULL) {
     pNtAllocateVirtualMemoryEx = (PNtAllocateVirtualMemoryEx)(void (*)(void))GetProcAddress(hDll, "NtAllocateVirtualMemoryEx");
     pRtlDllShutdownInProgress = (PRtlDllShutdownInProgress)(void (*)(void))GetProcAddress(hDll, "RtlDllShutdownInProgress");
     mi_win_freelibrary(hDll, hDllFree);
   }
   // Try to use Win7+ numa API
-  hDll = mi_win_getlibrary(TEXT("kernel32.dll"), &hDllFree);
+  hDll = mi_win_getlibrary(L"kernel32.dll", &hDllFree);
   if (hDll != NULL) {
     pGetCurrentProcessorNumberEx = (PGetCurrentProcessorNumberEx)(void (*)(void))GetProcAddress(hDll, "GetCurrentProcessorNumberEx");
     pGetNumaProcessorNodeEx = (PGetNumaProcessorNodeEx)(void (*)(void))GetProcAddress(hDll, "GetNumaProcessorNodeEx");
@@ -442,8 +445,13 @@ int _mi_prim_reuse(void* addr, size_t size) {
 }
 
 int _mi_prim_protect(void* addr, size_t size, bool protect) {
+  #if !MI_WIN_DESKTOP && WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP)
+  ULONG oldprotect = 0;
+  BOOL ok = VirtualProtectFromApp(addr, size, protect ? PAGE_NOACCESS : PAGE_READWRITE, &oldprotect);
+  #else
   DWORD oldprotect = 0;
   BOOL ok = VirtualProtect(addr, size, protect ? PAGE_NOACCESS : PAGE_READWRITE, &oldprotect);
+  #endif
   return (ok ? 0 : (int)GetLastError());
 }
 
@@ -611,7 +619,7 @@ void _mi_prim_process_info(mi_process_info_t* pinfo)
 
   // load psapi on demand
   mi_atomic_do_once{
-    HINSTANCE hDll = mi_win_loadlibrary(TEXT("psapi.dll"));
+    HINSTANCE hDll = mi_win_loadlibrary(L"psapi.dll");
     if (hDll != NULL) {
       pGetProcessMemoryInfo = (PGetProcessMemoryInfo)(void (*)(void))GetProcAddress(hDll, "GetProcessMemoryInfo");
       // mi_win_freelibrary(hDll, true);  // don't free
@@ -647,10 +655,6 @@ void _mi_prim_out_stderr( const char* msg )
     if (hcon == INVALID_HANDLE_VALUE) {
       hcon = GetStdHandle(STD_ERROR_HANDLE);   // returns NULL if no stderr is available
       #if MI_WIN_DESKTOP
-      if (hcon==NULL) {
-        AttachConsole(ATTACH_PARENT_PROCESS);  // if started from a parent console, try to attach to that
-        hcon = GetStdHandle(STD_ERROR_HANDLE);
-      }
       CONSOLE_SCREEN_BUFFER_INFO sbi;
       hconIsConsole = ((hcon != NULL && hcon != INVALID_HANDLE_VALUE) && GetConsoleScreenBufferInfo(hcon, &sbi));
       #endif
@@ -670,6 +674,13 @@ void _mi_prim_out_stderr( const char* msg )
           WriteFile(hcon, msg, (DWORD)len, &written, NULL);
         }
       }
+      #if MI_WIN_DESKTOP
+      else if (hcon == NULL) {
+        // no stderr handle: this is usually a GUI or detached process. Send the
+        // output to the debugger instead (see issue #1354 and #1429)
+        OutputDebugStringA(msg);
+      }
+      #endif
       // don't fall back to fputs or _cputs as the crt can have it locked
     }
   }
@@ -695,41 +706,63 @@ int _mi_prim_getenv(const char* name, char* result, size_t result_size) {
 // Random
 //----------------------------------------------------------------
 
-#if defined(MI_USE_RTLGENRANDOM) // || defined(__cplusplus)
-// We prefer to use BCryptGenRandom instead of (the unofficial) RtlGenRandom but when using
-// dynamic overriding, we observed it can raise an exception when compiled with C++, and
-// sometimes deadlocks when also running under the VS debugger.
-// In contrast, issue #623 implies that on Windows Server 2019 we need to use BCryptGenRandom.
-// To be continued..
+#if defined(MI_USE_RTLGENRANDOM) || MI_WIN_DESKTOP
+#if defined(_MSC_VER)
 #pragma comment (lib,"advapi32.lib")
+#endif
 #define RtlGenRandom  SystemFunction036
 mi_decl_externc BOOLEAN NTAPI RtlGenRandom(PVOID RandomBuffer, ULONG RandomBufferLength);
 
-bool _mi_prim_random_buf(void* buf, size_t buf_len) {
+static bool mi_win_rtl_gen_random(void* buf, size_t buf_len) {
+  mi_assert(buf_len <= ULONG_MAX);
+  if (buf_len > ULONG_MAX) return false;
   return (RtlGenRandom(buf, (ULONG)buf_len) != 0);
 }
+#endif
 
-#else
+#if defined(MI_USE_RTLGENRANDOM)
+bool _mi_prim_random_buf(void* buf, size_t buf_len) {
+  return mi_win_rtl_gen_random(buf, buf_len);
+}
 
+#elif !MI_WIN_DESKTOP
+// UWP/Xbox cannot dynamically load system libraries, so we link to BCryptGenRandom directly.
+#include <bcrypt.h>
+#if defined(_MSC_VER)
+#pragma comment (lib,"bcrypt.lib")
+#endif
 #ifndef BCRYPT_USE_SYSTEM_PREFERRED_RNG
 #define BCRYPT_USE_SYSTEM_PREFERRED_RNG 0x00000002
 #endif
 
-typedef LONG (NTAPI *PBCryptGenRandom)(HANDLE, PUCHAR, ULONG, ULONG);
-static  PBCryptGenRandom pBCryptGenRandom = NULL;
-
 bool _mi_prim_random_buf(void* buf, size_t buf_len) {
   mi_assert(buf_len <= ULONG_MAX);
   if (buf_len > ULONG_MAX) return false;
+  return (BCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)buf_len, BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0);
+}
+
+#else
+// We use the documented ProcessPrng (Windows 8+) which always succeeds, and fall back to RtlGenRandom
+// if it is not available. We avoid BCryptGenRandom as on Windows 7 / Server 2008 R2 it seems it can deadlock
+// when called while the loader lock is held (as during process attach) (issues #1395 and #1426).
+typedef BOOL (WINAPI *PProcessPrng)(PBYTE pbData, SIZE_T cbData);
+static  PProcessPrng pProcessPrng = NULL;
+
+bool _mi_prim_random_buf(void* buf, size_t buf_len) {
   mi_atomic_do_once {
-    HINSTANCE hDll = mi_win_loadlibrary(TEXT("bcrypt.dll"));
-    if (hDll != NULL) {
-      pBCryptGenRandom = (PBCryptGenRandom)(void (*)(void))GetProcAddress(hDll, "BCryptGenRandom");
-      // mi_win_freelibrary(hDll);  // don't free
+    if (win_major_version > 6 || (win_major_version == 6 && win_minor_version >= 2)) {
+      bool should_free = false;
+      HMODULE hDll = mi_win_getlibrary(L"bcryptprimitives.dll", &should_free);
+      if (hDll != NULL) {
+        pProcessPrng = (PProcessPrng)(void (*)(void))GetProcAddress(hDll, "ProcessPrng");
+        if (pProcessPrng == NULL) { mi_win_freelibrary(hDll, should_free); }  // otherwise don't free
+      }
     }
   }
-  if (pBCryptGenRandom == NULL) return false;
-  return (pBCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)buf_len, BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0);
+  if (pProcessPrng != NULL) {
+    return (pProcessPrng((PBYTE)buf, buf_len) != FALSE);
+  }
+  return mi_win_rtl_gen_random(buf, buf_len);
 }
 
 #endif  // MI_USE_RTLGENRANDOM
@@ -1225,4 +1258,3 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
     mi_allocator_done();
   }
 #endif
-

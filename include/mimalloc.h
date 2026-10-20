@@ -8,7 +8,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #ifndef MIMALLOC_H
 #define MIMALLOC_H
 
-#define MI_MALLOC_VERSION 30504   // major + 2 digits minor + 2 digits patch
+#define MI_MALLOC_VERSION 30600   // major + 2 digits minor + 2 digits patch
 
 // ------------------------------------------------------
 // Compiler specific attributes
@@ -144,6 +144,8 @@ mi_decl_export void mi_free_small(void* p) mi_attr_noexcept;
 // As `mi_free_small` but `p` should not be a NULL pointer.
 mi_decl_export void mi_free_small_nonnull(void* p) mi_attr_noexcept;
 
+// For runtime's: return the current owner thread-id of the page containing an allocation.
+mi_decl_nodiscard mi_decl_export size_t mi_thread_id_of(const void* p) mi_attr_noexcept;
 
 
 // -------------------------------------------------------------------------------------
@@ -241,9 +243,11 @@ struct mi_heap_s;
 typedef struct mi_heap_s mi_heap_t;
 
 mi_decl_nodiscard mi_decl_export mi_heap_t* mi_heap_new(void);
-mi_decl_export void mi_heap_delete(mi_heap_t* heap);            // move live blocks to the main heap
+
+mi_decl_export void mi_heap_delete(mi_heap_t* heap);            // move live blocks to the main heap 
 mi_decl_export void mi_heap_destroy(mi_heap_t* heap);           // free all live blocks
 mi_decl_export void mi_heap_set_numa_affinity(mi_heap_t* heap, int numa_node);
+mi_decl_export void mi_heap_set_debug_fill_preserve(mi_heap_t* heap, size_t preserve); // in debug mode, do not fill the first `preserve` bytes of blocks on allocation or free
 mi_decl_export void mi_heap_collect(mi_heap_t* heap, bool force);
 
 mi_decl_nodiscard mi_decl_export mi_heap_t* mi_heap_main(void);
@@ -318,6 +322,7 @@ typedef struct mi_heap_area_s {
 
 typedef bool (mi_cdecl mi_block_visit_fun)(const mi_heap_t* heap, const mi_heap_area_t* area, void* block, size_t block_size, void* arg);
 
+// Heap visitors assume no concurrent heap access (except thread exit).
 mi_decl_export bool   mi_heap_visit_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg);
 mi_decl_export bool   mi_heap_visit_abandoned_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg);
 
@@ -423,6 +428,13 @@ mi_decl_export bool  mi_manage_memory(void* start, size_t size, bool is_committe
 // unsafe: assumes the page belonging to `p` is only accessed by the calling thread.
 mi_decl_export bool mi_unsafe_heap_page_is_under_utilized(mi_heap_t* heap, void* p, size_t perc_threshold) mi_attr_noexcept;
 
+// Owner-thread only: abandon pages and delete the theap (not its heap or live blocks).
+mi_decl_export void mi_theap_delete(mi_theap_t* theap) mi_attr_noexcept;
+
+// Abandon all theap pages, preserving live blocks and the theap for reuse. The owner must be the current thread or quiescent outside mimalloc (excluding concurrent heap/theap deletion).
+mi_decl_export void mi_theap_quiescent_abandon(mi_theap_t* theap) mi_attr_noexcept;
+
+
 // ------------------------------------------------------
 // Deprecated
 // ------------------------------------------------------
@@ -481,11 +493,11 @@ typedef enum mi_option_e {
   mi_option_deprecated_visit_abandoned, // allow visiting theap blocks from abandoned threads (=0)
   mi_option_guarded_min,                // only used when building with MI_GUARDED: minimal rounded object size for guarded objects (=0)
   mi_option_guarded_max,                // only used when building with MI_GUARDED: maximal rounded object size for guarded objects (=0)
-  mi_option_guarded_precise,            // disregard minimal alignment requirement to always place guarded blocks exactly in front of a guard page (=0)
-  mi_option_guarded_sample_rate,        // 1 out of N allocations in the min/max range will be guarded (=1000)
+  mi_option_unsafe_guarded_precise,     // disregard minimal alignment requirement to always place guarded blocks exactly in front of a guard page (=0)
+  mi_option_guarded_sample_rate,        // guard an object in the min/max range about every N requested bytes (=0)
   mi_option_guarded_sample_seed,        // can be set to allow for a (more) deterministic re-execution when a guard page is triggered (=0)
   mi_option_generic_collect,            // collect theaps every N (=10000) generic allocation calls
-  mi_option_page_reclaim_on_free,       // reclaim abandoned pages on a free (=0). -1 disallow always, 0 allows if the page originated from the current theap, 1 allow always
+  mi_option_page_reclaim_on_free,       // heap-creation default for reclaim on free: -1 disallow, 0 originating theap only, 1 allow across theaps
   mi_option_page_full_retain,           // retain N full (small) pages per size class (=2)
   mi_option_page_max_candidates,        // max candidate pages to consider for allocation (=4)
   mi_option_max_vabits,                 // max user space virtual address bits to consider (=48)
@@ -498,10 +510,10 @@ typedef enum mi_option_e {
   mi_option_arena_max_object_size,      // set maximal object size that can be allocated in an arena (in KiB) (=2GiB on 64-bit). 
   mi_option_arena_is_numa_local,        // experimental: associate local numa node with an initial arena allocation
   mi_option_stats_merge_on_collect,     // on each theap collection, the theap stats are merged automatically with the parent heap
-  mi_option_profile_alloc_interval,     // number of allocated bytes between automatic dumps of the `MIMALLOC_PROFILE` heap profiler (internally, this value is in KiB; use `mi_option_get_size`) (=0, disabled)
-  mi_option_profile_inuse_interval,     // number of in-use bytes grown between automatic dumps of the `MIMALLOC_PROFILE` heap profiler (internally, this value is in KiB; use `mi_option_get_size`) (=0, disabled)
-  mi_option_profile_time_interval,      // number of seconds between automatic dumps of the `MIMALLOC_PROFILE` heap profiler (=0, disabled)
-  mi_option_profile_sample_rate,        // sample rate (in bytes) for the `MIMALLOC_PROFILE` heap profiler (internally, this value is in KiB; use `mi_option_get_size`) (=16 KiB)
+  mi_option_profile_alloc_interval,     // number of allocated bytes between automatic snapshots of the heap profiler (internally, this value is in KiB; use `mi_option_get_size`) (=1GiB, disabled)
+  mi_option_profile_inuse_interval,     // number of in-use bytes grown between automatic snapshots of the heap profiler (internally, this value is in KiB; use `mi_option_get_size`) (=0, disabled)
+  mi_option_profile_time_interval,      // number of seconds between automatic snapshots of the  heap profiler (=0, disabled)
+  mi_option_profile_sample_rate,        // sample rate (in bytes) for heap profiler (internally, this value is in KiB; use `mi_option_get_size`) (=512 KiB)
   mi_option_stats_merge_threshold,      // on a page stats update, merge theap stats into the parent heap if N bytes were freed/allocated (=0, disabled)
   mi_option_arena_purge_immediate_size, // ranges above this size are purged immediately
   _mi_option_last,

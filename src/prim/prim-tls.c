@@ -6,13 +6,13 @@ terms of the MIT license. A copy of the license can be found in the file
 -----------------------------------------------------------------------------*/
 
 #include "mimalloc.h"
-#include "mimalloc/internal.h"
 #include "mimalloc/prim.h"
-#include "mimalloc/prim-tls.h"
+#include "mimalloc/prim/prim-tls.h"
+#include "mimalloc/util/options.h"              // _mi_error_message
 
 // --------------------------------------------------------------------------
 // Implement fast access to the thread local storage for `_mi_theap_default()`
-// and `mi_theap_cached()`. See `include/mimalloc/prim-tls.h` for more info
+// and `mi_theap_cached()`. See `include/mimalloc/prim/prim-tls.h` for more info
 // on the TLS models.
 // --------------------------------------------------------------------------
 

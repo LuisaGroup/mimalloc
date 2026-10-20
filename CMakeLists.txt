@@ -23,8 +23,8 @@ set_property(CACHE MI_OPT_ARCH PROPERTY STRINGS "OFF" "ON" "avx2" "armv8.1" "arm
 set(MI_DEBUG "DEFAULT" CACHE STRING "Enable assertion checks: OFF, ON, INTERNAL, FULL, DEFAULT. INTERNAL adds extra internal invariant checks, while FULL adds expensive heap invariant checks")
 set_property(CACHE MI_DEBUG PROPERTY STRINGS "OFF" "ON" "INTERNAL" "FULL" "DEFAULT")
 
-set(MI_TRACK "OFF" CACHE STRING "Enable tracking: OFF, ASAN (address sanitizer), VALGRIND, ETW (Windows event tracing). Adds a small overhead.")
-set_property(CACHE MI_TRACK PROPERTY STRINGS "OFF" "ASAN" "VALGRIND" "ETW")
+set(MI_TRACK "OFF" CACHE STRING "Enable tracking: OFF, ASAN (address sanitizer), VALGRIND, ETW (Windows event tracing), CUSTOM (application-defined hooks). Adds a small overhead.")
+set_property(CACHE MI_TRACK PROPERTY STRINGS "OFF" "ASAN" "VALGRIND" "ETW" "CUSTOM")
 
 set(MI_STATS "DEFAULT" CACHE STRING "Enable statistics.")
 set_property(CACHE MI_STATS PROPERTY STRINGS "OFF" "ON" "FULL" "DEFAULT")
@@ -105,27 +105,34 @@ include(GNUInstallDirs)
 include("cmake/mimalloc-config-version.cmake")
 
 set(mi_sources
-    src/alloc.c
-    src/alloc-aligned.c
-    src/alloc-posix.c
-    src/arena.c
-    src/bitmap.c
-    src/heap.c
-    src/init.c
-    src/libc.c
-    src/options.c
-    src/os.c
-    src/page.c
-    src/page-map.c   
+    src/prim/os.c
     src/prim/prim.c
     src/prim/prim-tls.c 
-    src/random.c
-    src/sample-guarded.c
-    src/sample-profile.c
-    src/stats.c
-    src/subproc.c
-    src/theap.c
-    src/threadlocal.c
+    src/util/libc.c
+    src/util/options.c
+    src/util/random.c
+    src/util/stats.c
+    src/util/threadlocal.c
+    src/arena/arena.c
+    src/arena/arena-alloc.c
+    src/arena/arena-page.c
+    src/arena/bitmap.c
+    src/arena/bitmap-chunk.c
+    src/alloc/alloc.c
+    src/alloc/alloc-generic.c
+    # src/alloc/free.c
+    # src/alloc/alloc-override.c    
+    src/alloc/alloc-aligned.c
+    src/alloc/alloc-posix.c
+    src/alloc/page.c
+    src/alloc/page-queue.c
+    src/heap/heap.c
+    src/heap/init.c
+    src/heap/page-map.c
+    src/heap/subproc.c
+    src/heap/theap.c
+    src/profile/sample-guarded.c
+    src/profile/sample-profile.c
     src/profile/pprof.c)  
 
 set(mi_cflags "")
@@ -386,6 +393,9 @@ elseif(MI_TRACK STREQUAL "ETW")
     message(STATUS "Compile with Windows event tracing support (MI_TRACK=ETW)")
     list(APPEND mi_defines MI_TRACK_ETW=1)
   endif()
+elseif(MI_TRACK STREQUAL "CUSTOM")
+  message(STATUS "Compile with custom allocation hooks (MI_TRACK=CUSTOM)")
+  list(APPEND mi_defines MI_TRACK_CUSTOM=1)
 elseif(MI_TRACK)
   message(STATUS "Invalid option value: MI_TRACK=${MI_TRACK} (ignored)")
 endif()
@@ -892,7 +902,7 @@ endif()
 # set language for source files now
 if(MI_USE_CXX)
   set_source_files_properties(${mi_sources} PROPERTIES LANGUAGE CXX )
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c  test/test-stress-subprocs.c test/test-stress-pprof.c test/test-profile.c test/test-pprof.c PROPERTIES LANGUAGE CXX )
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-arena.c test/test-bitmap.c test/test-qsbr.c test/test-stress.c test/test-stress-heaps.c  test/test-stress-subprocs.c test/test-stress-pprof.c test/test-profile.c test/test-pprof.c test/test-fork.c PROPERTIES LANGUAGE CXX )
 endif()
 
 # platform specific headers that are only needed for profiling support
@@ -1029,9 +1039,12 @@ message(STATUS "")
 # Main targets
 # -----------------------------------------------------------------------------
 
+# for better codegen, we prefer the static.c single source for release builds
+set(mi_static_sources "$<IF:$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>,$<CONFIG:MinSizeRel>>,src/static.c,${mi_sources}>")
+
 # shared library
 if(MI_BUILD_SHARED)
-  add_library(mimalloc SHARED ${mi_sources})
+  add_library(mimalloc SHARED ${mi_static_sources})
   set_target_properties(mimalloc PROPERTIES VERSION ${mi_version} SOVERSION ${mi_version_major} OUTPUT_NAME ${mi_libname} )
   target_compile_definitions(mimalloc PRIVATE ${mi_defines} MI_SHARED_LIB MI_SHARED_LIB_EXPORT)
   target_compile_options(mimalloc PRIVATE ${mi_cflags} ${mi_cflags_dynamic})
@@ -1102,7 +1115,7 @@ endif()
 
 # static library
 if (MI_BUILD_STATIC)
-  add_library(mimalloc-static STATIC ${mi_sources})
+  add_library(mimalloc-static STATIC ${mi_static_sources})
   set_property(TARGET mimalloc-static PROPERTY OUTPUT_NAME ${mi_libname})
   set_property(TARGET mimalloc-static PROPERTY POSITION_INDEPENDENT_CODE ON)
   target_compile_definitions(mimalloc-static PRIVATE ${mi_defines} MI_STATIC_LIB)
@@ -1183,7 +1196,10 @@ if (MI_BUILD_TESTS)
   enable_testing()
 
   # static link tests
-  foreach(TEST_NAME api api-fill stress-heaps stress-subprocs stress stress-pprof profile pprof)
+  foreach(TEST_NAME api api-fill arena bitmap stress-heaps stress-subprocs stress stress-pprof profile pprof fork)
+    if((TEST_NAME STREQUAL "arena" OR TEST_NAME STREQUAL "bitmap") AND (NOT MI_BUILD_STATIC OR MI_DEBUG_TSAN))
+      continue()
+    endif()
     add_executable(mimalloc-test-${TEST_NAME} test/test-${TEST_NAME}.c)
     target_compile_definitions(mimalloc-test-${TEST_NAME} PRIVATE ${mi_defines})
     target_compile_options(mimalloc-test-${TEST_NAME} PRIVATE ${mi_cflags})
@@ -1195,7 +1211,13 @@ if (MI_BUILD_TESTS)
     else()
       message(STATUS "cannot build TSAN tests without MI_BUILD_SHARED being enabled")
     endif()
-    if(MI_GUARDED AND NOT (TEST_NAME STREQUAL "profile" OR TEST_NAME STREQUAL "pprof" OR TEST_NAME STREQUAL "stress-pprof"))
+    if(TEST_NAME MATCHES "prof")
+      add_custom_command(TARGET mimalloc-test-${TEST_NAME} PRE_BUILD COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/profile")
+    endif()
+
+    if(MI_DEBUG_TSAN AND TEST_NAME STREQUAL "fork")
+    # don't add as a test
+    elseif(MI_GUARDED AND NOT (TEST_NAME STREQUAL "profile" OR TEST_NAME STREQUAL "pprof" OR TEST_NAME STREQUAL "stress-pprof"))
     add_test(NAME test-${TEST_NAME} COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_GUARDED_SAMPLE_RATE=1024 $<TARGET_FILE:mimalloc-test-${TEST_NAME}>)
     elseif(TEST_NAME STREQUAL "stress-heaps")
     add_test(NAME test-${TEST_NAME} COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_ARENA_EAGER_COMMIT=0 MIMALLOC_PAGE_COMMIT_ON_DEMAND=0 $<TARGET_FILE:mimalloc-test-${TEST_NAME}>)
@@ -1242,6 +1264,29 @@ if (MI_BUILD_TESTS)
       endif()
       add_test(NAME test-stress-dynamic COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_VERBOSE=1 ${LD_PRELOAD}=$<TARGET_FILE:mimalloc> $<TARGET_FILE:mimalloc-test-stress-dynamic>)
     endif()
+  endif()
+
+  # The QSBR adapter embeds its own allocator with an extended internal layout.
+  add_executable(mimalloc-test-qsbr test/test-qsbr.c)
+  target_compile_definitions(mimalloc-test-qsbr PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-qsbr PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-qsbr PRIVATE include)
+  target_link_libraries(mimalloc-test-qsbr PRIVATE ${mi_libraries})
+  add_test(NAME test-qsbr COMMAND mimalloc-test-qsbr)
+
+  # Rust crate tests (only if `cargo` is available)
+  find_program(MI_CARGO cargo HINTS "$ENV{CARGO_HOME}/bin" "$ENV{HOME}/.cargo/bin")
+  if(MI_CARGO AND NOT (MI_DEBUG_TSAN OR MI_DEBUG_UBSAN OR (MI_TRACK STREQUAL "ASAN")))
+    message(STATUS "Add Rust crate tests (using ${MI_CARGO})")
+    set(mi_cargo_args test --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/contrib/rust/Cargo.toml"
+                           --target-dir "${CMAKE_CURRENT_BINARY_DIR}/rust" "$<IF:$<CONFIG:Debug>,--features=debug,--release>")
+    if(MI_SECURE)
+      list(APPEND mi_cargo_args --features=secure)
+    endif()
+    if(MI_OPT_ARCH)
+      list(APPEND mi_cargo_args --features=opt_arch)
+    endif()
+    add_test(NAME test-rust COMMAND ${MI_CARGO} ${mi_cargo_args})
   endif()
 endif()
 
