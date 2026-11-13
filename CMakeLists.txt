@@ -2,10 +2,15 @@ cmake_minimum_required(VERSION 3.18)
 project(libmimalloc C)
 
 set(CMAKE_C_STANDARD 11)
-set(CMAKE_CXX_STANDARD 17)
+if(NOT DEFINED CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 17)
+endif()
 
-set(MI_SECURE "OFF" CACHE STRING "Use security mitigations (like meta data guard pages, allocation randomization, double-free mitigation, and free-list corruption detection): OFF, ON, FULL. The FULL setting adds guard pages at the end of each mimalloc page (which may be expensive)")
-set_property(CACHE MI_SECURE PROPERTY STRINGS "OFF" "ON" "FULL")
+set(MI_SECURE "DEFAULT" CACHE STRING "Use security mitigations (like meta data guard pages, allocation randomization, double-free mitigation, and free-list corruption detection): OFF, MINIMAL, CHECKED, ON, FULL, DEFAULT. The FULL setting adds guard pages at the end of each mimalloc page (which may be expensive). MINIMAL only uses guard pages around metadata and after huge blocks (and randomizes OS allocation addresses). CHECKED adds validation of pointers passed to free, encoded free lists, and randomized free lists. DEFAULT is CHECKED with MI_MTE or MI_PAC enabled, level 3 on CHERI (CHECKED plus zero-on-free and double-free checks), and OFF otherwise.")
+set_property(CACHE MI_SECURE PROPERTY STRINGS "DEFAULT" "OFF" "MINIMAL" "CHECKED" "ON" "FULL")
+
+set(MI_SECURE_ENV "DEFAULT" CACHE STRING "Restrict environment options to show_stats, verbose, and allow_thp: DEFAULT, ON, or OFF. DEFAULT enables this with MI_SECURE>=1, MI_PAC, or MI_MTE. OFF preserves the existing MI_SECURE environment restrictions.")
+set_property(CACHE MI_SECURE_ENV PROPERTY STRINGS "DEFAULT" "ON" "OFF")
 
 option(MI_OVERRIDE          "Override the standard malloc interface (i.e. define entry points for 'malloc', 'free', etc)" ON)
 option(MI_XMALLOC           "Enable abort() call on memory allocation failure by default" OFF)
@@ -61,8 +66,11 @@ option(MI_FREE_USE_PAGEMAP  "Always use the page map when free-ing a pointer -- 
 option(MI_PADDING           "Enable padding to detect heap block overflow (always on in DEBUG or SECURE mode, or with Valgrind/ASAN)" OFF)
 option(MI_NO_PADDING        "Force no use of padding even in DEBUG mode etc." OFF)
 option(MI_SKIP_COLLECT_ON_EXIT "Skip collecting memory on program exit" OFF)
+option(MI_MTE               "Use memory tagging (MTE) (arm64 only, experimental): OFF, PREFER, or ON. Use PREFER to use MTE if available at runtime, and ON to require that MTE is supported and enabled at runtime (which is slightly faster)" OFF)
+option(MI_PAC               "Sign critical internal pointers (page map and free lists): OFF, WEAK, or ON. Use WEAK for a software process key, and ON to use arm64 pointer authentication (PAC) which must be supported at runtime (arm64 with GCC or clang only)" OFF)
 option(MI_EXTRA_CPPDEFS     "Extra pre-processor definitions (use as `-DMI_EXTRA_CPPDEFS=\"opt1=val1;opt2=val2\"`)" "")
 option(MI_SEE_ASM           "Generate assembly files" OFF)
+option(MI_SECURE_NO_STATIC_GUARD "Disable guard pages in static data (mi_process_t) in secure mode (use this if using for example the Boehm-weiser GC); the sealed process data is still read-only" OFF)
 
 # negated options for vcpkg features
 option(MI_NO_USE_CXX        "Use plain C compilation (has priority over MI_USE_CXX)" OFF)
@@ -101,14 +109,17 @@ option(MI_TRACK_ETW           "Deprecated: Compile with Windows event tracing (E
 
 include(CheckLinkerFlag)    # requires cmake 3.18
 include(CheckIncludeFiles)
+include(CheckSymbolExists)
+include(CMakePushCheckState)
 include(GNUInstallDirs)
 include("cmake/mimalloc-config-version.cmake")
 
 set(mi_sources
     src/prim/os.c
     src/prim/prim.c
-    src/prim/prim-tls.c 
+    src/prim/prim-tls.c
     src/util/libc.c
+    src/util/memid.c
     src/util/options.c
     src/util/random.c
     src/util/stats.c
@@ -116,24 +127,28 @@ set(mi_sources
     src/arena/arena.c
     src/arena/arena-alloc.c
     src/arena/arena-page.c
+    src/arena/arena-page-alloc.c
+    src/arena/arena-heap.c
     src/arena/bitmap.c
     src/arena/bitmap-chunk.c
     src/alloc/alloc.c
     src/alloc/alloc-generic.c
     # src/alloc/free.c
-    # src/alloc/alloc-override.c    
+    # src/alloc/alloc-override.c
     src/alloc/alloc-aligned.c
     src/alloc/alloc-posix.c
     src/alloc/page.c
     src/alloc/page-queue.c
     src/heap/heap.c
-    src/heap/init.c
+    src/heap/process.c
     src/heap/page-map.c
     src/heap/subproc.c
     src/heap/theap.c
     src/profile/sample-guarded.c
     src/profile/sample-profile.c
-    src/profile/pprof.c)  
+    src/profile/pprof.c
+    src/profile/pprof-os.c
+    src/profile/pprof-write.c)
 
 set(mi_cflags "")
 set(mi_cflags_static "")            # extra flags for a static library build
@@ -170,6 +185,14 @@ function(STRIEQUAL str1 str2 is_equal)
     endif()
 endfunction()
 
+# check if `symbol` is declared in `headers` and links when also linking with `libs`
+function(check_symbol_exists_with_libs symbol headers libs outvar)
+  cmake_push_check_state()
+  list(APPEND CMAKE_REQUIRED_LIBRARIES ${libs})
+  check_symbol_exists(${symbol} "${headers}" ${outvar})
+  cmake_pop_check_state()
+endfunction()
+
 # -----------------------------------------------------------------------------
 # Convenience: set default build type and compiler depending on the build directory
 # -----------------------------------------------------------------------------
@@ -190,9 +213,13 @@ if(CMAKE_GENERATOR MATCHES "^Visual Studio.*$")
   message(STATUS "For example: 'cmake --build . --config=Release")
 endif()
 
-if(NOT MI_SECURE AND NOT MI_SECURE_FULL AND "${CMAKE_BINARY_DIR}" MATCHES ".*(S|s)ecure$")
+if((MI_SECURE STREQUAL "DEFAULT" OR NOT MI_SECURE) AND NOT MI_SECURE_FULL AND "${CMAKE_BINARY_DIR}" MATCHES ".*(S|s)ecure$")
   message(STATUS "Default to secure build")
   set(MI_SECURE "ON")
+elseif(MI_SECURE STREQUAL "DEFAULT")
+  if(MI_MTE OR MI_PAC)
+    set(MI_SECURE "CHECKED")  # guard pages after huge blocks (which are not memory tagged), validate pointers on free, encoded free list
+  endif()                     # otherwise use the default level in `types.h` (OFF, or level 3 on CHERI)
 endif()
 
 
@@ -214,6 +241,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86|i[3456]86)$" OR CMAKE_GENERATOR_PLATFOR
   set(MI_ARCH "x86")
 elseif((CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|x64|amd64|AMD64)$" OR CMAKE_GENERATOR_PLATFORM STREQUAL "x64" OR "x86_64" IN_LIST CMAKE_OSX_ARCHITECTURES) AND NOT CMAKE_GENERATOR_PLATFORM STREQUAL "ARM64") # must be before arm64
   set(MI_ARCH "x64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|armv[3-9].?|ARM)$" AND MI_ARCH_BITS STREQUAL "32")  # must be before arm64: a 32-bit userland on an ARMv8/v9 cpu reports armv8l/armv9l
+  set(MI_ARCH "arm32")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|armv[89].?|ARM64)$" OR CMAKE_GENERATOR_PLATFORM STREQUAL "ARM64" OR "arm64" IN_LIST CMAKE_OSX_ARCHITECTURES)
   set(MI_ARCH "arm64")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|armv[34567].?|ARM)$")
@@ -243,8 +272,14 @@ if(MI_OPT_ARCH STREQUAL "DEFAULT")
   endif()
 endif()
 
-if(DEFINED ENV{MI_TEST_LIGHT})
-  list(APPEND mi_defines MI_TEST_LIGHT=1)  # to lighten test load in test integration
+if(DEFINED ENV{MI_TEST_LIGHT})  # to lighten test load in test integration (use 2 to lighten further, e.g. under emulation)
+  if("$ENV{MI_TEST_LIGHT}" MATCHES "^[0-9]+$")
+    if(NOT "$ENV{MI_TEST_LIGHT}" EQUAL 0)
+      list(APPEND mi_defines MI_TEST_LIGHT=$ENV{MI_TEST_LIGHT})
+    endif()
+  else()
+    list(APPEND mi_defines MI_TEST_LIGHT=1)
+  endif()
 endif()
 
 # -----------------------------------------------------------------------------
@@ -274,7 +309,7 @@ if(MI_USE_CXX)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Intel" AND NOT CMAKE_CXX_COMPILER_ID MATCHES "IntelLLVM")
     list(APPEND mi_cflags -Kc++)
   elseif(MSVC AND MSVC_VERSION GREATER_EQUAL 1914)
-    list(APPEND mi_cflags /Zc:__cplusplus)  
+    list(APPEND mi_cflags /Zc:__cplusplus)
   endif()
 endif()
 
@@ -335,16 +370,41 @@ if(WIN32)
   endif()
 endif()
 
+if(MI_SECURE_ENV STREQUAL "DEFAULT")
+  # Resolve in types.h, also for direct builds and Rust.
+elseif(MI_SECURE_ENV STREQUAL "ON")
+  list(APPEND mi_defines MI_SECURE_ENV=1)
+elseif(MI_SECURE_ENV STREQUAL "OFF")
+  list(APPEND mi_defines MI_SECURE_ENV=0)
+else()
+  message(FATAL_ERROR "Invalid value for MI_SECURE_ENV: ${MI_SECURE_ENV} (expecting: DEFAULT, ON, or OFF)")
+endif()
+
 if(MI_SECURE_FULL)
   message(STATUS "MI_SECURE_FULL is deprecated, use MI_SECURE=FULL instead")
   set(MI_SECURE "FULL")
 endif()
-if(MI_SECURE STREQUAL "FULL")  
+if(MI_SECURE STREQUAL "FULL")
   message(STATUS "Use full secure build (MI_SECURE=FULL, may be expensive)")
   list(APPEND mi_defines MI_SECURE=5)
+elseif(MI_SECURE STREQUAL "MINIMAL")
+  message(STATUS "Use minimal security mitigations (guard pages around metadata and after huge blocks, and randomized OS allocation addresses) (MI_SECURE=MINIMAL)")
+  list(APPEND mi_defines MI_SECURE=1)
+  set(MI_SECURE "OFF")  # so if(MI_SECURE) is false in subsequent checks
+elseif(MI_SECURE STREQUAL "CHECKED")
+  message(STATUS "Use minimal security mitigations, validate pointers passed to free, encode free lists, and randomize free lists (MI_SECURE=CHECKED)")
+  list(APPEND mi_defines MI_SECURE=2)
+  if(MI_FREE_IS_CHECKED STREQUAL "DEFAULT")
+    set(MI_FREE_IS_CHECKED ON)  # implied by MI_SECURE=2
+  endif()
+  set(MI_SECURE "OFF")  # so if(MI_SECURE) is false in subsequent checks
+elseif(MI_SECURE STREQUAL "DEFAULT")
+  set(MI_SECURE "OFF")  # no define: use the default level in `types.h`
 elseif(MI_SECURE)
   message(STATUS "Use secure build (MI_SECURE=${MI_SECURE})")
   list(APPEND mi_defines MI_SECURE=4)
+else()
+  list(APPEND mi_defines MI_SECURE=0)  # explicit opt-out (overrides the default level in `types.h`)
 endif()
 
 if(MI_TRACK_VALGRIND)
@@ -419,6 +479,38 @@ if (MI_SKIP_COLLECT_ON_EXIT)
   list(APPEND mi_defines MI_SKIP_COLLECT_ON_EXIT=1)
 endif()
 
+if(MI_MTE)
+  if(MI_ARCH STREQUAL "arm64")
+    if(MI_MTE STREQUAL "PREFER")
+      message(STATUS "Use memory tagging if available at runtime (MI_MTE=PREFER)")
+      list(APPEND mi_defines MI_MTE=1)
+    elseif(MI_MTE MATCHES "^([Oo][Nn]|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Yy]|1)$")
+      message(STATUS "Use memory tagging and require it to be supported and enabled at runtime (MI_MTE=ON)")
+      list(APPEND mi_defines MI_MTE=2)
+    else()
+      message(FATAL_ERROR "Invalid value for MI_MTE: ${MI_MTE} (expecting: OFF, PREFER, or ON)")
+    endif()
+  else()
+    message(WARNING "Memory tagging is only supported on arm64 (MI_MTE=OFF)")
+    set(MI_MTE OFF)
+  endif()
+endif()
+
+if(MI_PAC)
+  if(MI_PAC STREQUAL "WEAK")
+    message(STATUS "Sign internal pointers using a software process key (MI_PAC=WEAK)")
+    list(APPEND mi_defines MI_PAC=1)
+  elseif(MI_PAC MATCHES "^([Oo][Nn]|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Yy]|1)$")
+    if(NOT MI_ARCH STREQUAL "arm64" OR MSVC)
+      message(FATAL_ERROR "Pointer authentication (MI_PAC=ON) is only supported on arm64 with GCC or clang (use MI_PAC=WEAK instead)")
+    endif()
+    message(STATUS "Sign internal pointers using pointer authentication and require it to be supported at runtime (MI_PAC=ON)")
+    list(APPEND mi_defines MI_PAC=2)
+  else()
+    message(FATAL_ERROR "Invalid value for MI_PAC: ${MI_PAC} (expecting: OFF, WEAK, or ON)")
+  endif()
+endif()
+
 if(MI_CHECK_FULL OR MI_DEBUG_FULL)
   message(STATUS "Use of MI_CHECK_FULL/MI_DEBUG_FULL is deprecated, use MI_DEBUG=FULL instead")
   if(MI_DEBUG STREQUAL "DEFAULT")
@@ -464,7 +556,7 @@ elseif(NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 if(MI_GUARDED STREQUAL "DEFAULT")
-  if(MI_DEBUG)
+  if(MI_DEBUG AND NOT (EMSCRIPTEN OR CMAKE_SYSTEM_NAME STREQUAL "WASI"))   # no memory protection on wasm
     set(MI_GUARDED "FULL")
   else()
     set(MI_GUARDED "OFF")
@@ -492,6 +584,11 @@ else()
   endif()
 endif()
 
+if(MI_SECURE_NO_STATIC_GUARD)
+  message(STATUS "Disable guard pages in static data (mi_process_t) (MI_SECURE_NO_STATIC_GUARD=ON)")
+  list(APPEND mi_defines MI_SECURE_NO_STATIC_GUARD=1)
+endif()
+
 if(MI_FREE_IS_CHECKED STREQUAL "DEFAULT")
   if (MI_SECURE)
     set(MI_FREE_IS_CHECKED ON)
@@ -504,7 +601,7 @@ if(MI_FREE_IS_CHECKED STREQUAL "ON")
   message(STATUS "Check validity eof pointers passed to 'mi_free' (MI_FREE_IS_CHECKED=ON)")
   list(APPEND mi_defines MI_FREE_IS_CHECKED=1)
 elseif(MI_SECURE)
-  message(STATUS "Check validity of pointers passed to 'mi_free' (MI_SECURE=ON, MI_FREE_IS_CHECKED=ON)")    
+  message(STATUS "Check validity of pointers passed to 'mi_free' (MI_SECURE=ON, MI_FREE_IS_CHECKED=ON)")
 elseif(MI_FREE_IS_CHECKED STREQUAL "SHARED")
   message(STATUS "Check validity of pointers passed to 'mi_free' only in the dynamic/shared link library (MI_FREE_IS_CHECKED=SHARED)")
   list(APPEND mi_cflags_dynamic -DMI_FREE_IS_CHECKED=1)
@@ -552,19 +649,15 @@ else()
   list(APPEND mi_defines MI_PROFILE=0)
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL "WASI")
-  message(STATUS "Enabling MI_FREE_USE_PAGEMAP since the target (WASI) does not support large OS aligned allocations well")
-  set(MI_FREE_USE_PAGEMAP ON)
-endif()
 if(MI_FREE_USE_PAGEMAP)
   message(STATUS "Always use the pagemap in mi_free (MI_FREE_USE_PAGEMAP=ON)")
   list(APPEND mi_defines MI_FREE_USE_PAGEMAP=1)
-endif()  
+endif()
 
 # deprecated
 if(MI_OPT_FREE_SMALL STREQUAL "DEFAULT")
   # do nothing
-elseif(MI_OPT_FREE_SMALL) 
+elseif(MI_OPT_FREE_SMALL)
   if(MI_GUARDED OR MI_SECURE)
     message(STATUS "Cannot enable MI_OPT_FREE_SMALL in secure or guarded mode (MI_OPT_FREE_SMALL=OFF)")
   else()
@@ -687,12 +780,14 @@ if(MI_TLS_RECURSE_GUARD)
   list(APPEND mi_defines MI_TLS_RECURSE_GUARD=1)
 endif()
 
-if("$ENV{MSYSTEM}" STREQUAL "UCRT64")
-  message(STATUS "Detected MSYS2 UCRT64 environment")
-  set(MI_MINGW_UCRT64 "ON")
-  list(APPEND mi_defines MI_MINGW_UCRT64=1)
-elseif("$ENV{MSYSTEM}" STREQUAL "MSYS")
-  message(STATUS "Detected MSYS2 MSYS/Cygwin environment")
+if(MINGW)
+  # mingw-w64 defines `_UCRT` in `_mingw.h` when targeting the UCRT (instead of msvcrt)
+  check_symbol_exists(_UCRT "stdio.h" MI_MINGW_UCRT)
+  if(MI_MINGW_UCRT)
+    message(STATUS "Detected MinGW with UCRT")
+  endif()
+elseif(CMAKE_C_PLATFORM_ID MATCHES "^(Cygwin|MSYS)$")  # based on __CYGWIN__ or __MSYS__
+  message(STATUS "Detected Cygwin/MSYS environment")
   set(MI_CYGWIN "ON")
 endif()
 
@@ -713,7 +808,7 @@ if(MI_WIN_INIT STREQUAL "DEFAULT")
     set(MI_WIN_INIT "FLS")
   endif()
 endif()
-  
+
 if(MI_WIN_INIT STREQUAL "RAW_DLLMAIN")
   message(STATUS "Use raw Dll main entry on Windows to initialize and finalize mimalloc (MI_WIN_INIT=RAW_DLLMAIN)")
   message(STATUS "Note: this can lead to link errors if other libraries also try to define a raw Dll main entry point")
@@ -752,11 +847,11 @@ if(CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang|GNU" AND NOT MI_CLANG_CL)
     list(APPEND mi_cflags -Wstrict-prototypes)
   endif()
   if(CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang")
-    list(APPEND mi_cflags -Wno-static-in-inline -mno-outline)
+    list(APPEND mi_cflags -mno-outline)
   endif()
   if(CMAKE_C_COMPILER_ID STREQUAL "AppleClang" AND MI_ARCH STREQUAL "arm64")
     list(APPEND mi_cflags -Xclang -fno-split-cold-code)
-  endif()  
+  endif()
 endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "Intel")
@@ -786,8 +881,8 @@ endif()
 
 # Compiler and architecture specific flags
 if(MI_OPT_ARCH MATCHES "^(1|ON|YES|TRUE|Y)$")
-  if(APPLE AND CMAKE_OSX_ARCHITECTURES AND CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang" )  
-    set(MI_OPT_ARCH "ON")    
+  if(APPLE AND CMAKE_OSX_ARCHITECTURES AND CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang" )
+    set(MI_OPT_ARCH "ON")
   elseif(MI_ARCH STREQUAL "arm64")
     if(APPLE)
       set(MI_OPT_ARCH "armv8.3")      # M1+ supports arm8.3-a (which includes LDAPR (load-aquire))
@@ -799,10 +894,10 @@ if(MI_OPT_ARCH MATCHES "^(1|ON|YES|TRUE|Y)$")
   elseif(MI_ARCH STREQUAL "x64")
     set(MI_OPT_ARCH "avx2")
   elseif(MI_ARCH MATCHES "riscv")
-    set(MI_OPT_ARCH "rv${MI_ARCH_BITS}gcb_zacas")  # fast bit scan and atomics (since 2023) 
-    # set(MI_OPT_ARCH "rv${MI_ARCH_BITS}gcb_zacas_zalasr")  # fast bit scan and atomics (since 2025) 
+    set(MI_OPT_ARCH "rv${MI_ARCH_BITS}gcb_zacas")  # fast bit scan and atomics (since 2023)
+    # set(MI_OPT_ARCH "rv${MI_ARCH_BITS}gcb_zacas_zalasr")  # fast bit scan and atomics (since 2025)
   else()
-    set(MI_OPT_ARCH OFF)              
+    set(MI_OPT_ARCH OFF)
   endif()
 endif()
 
@@ -810,7 +905,7 @@ endif()
 set(MI_OPT_ARCH_FLAGS "")
 if(NOT MI_OPT_ARCH MATCHES "^(0|OFF|NO|FALSE|N)$")
   # apple support for multi-arch binaries (#999)
-  if(APPLE AND CMAKE_OSX_ARCHITECTURES AND CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang")  
+  if(APPLE AND CMAKE_OSX_ARCHITECTURES AND CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang")
     if("arm64" IN_LIST CMAKE_OSX_ARCHITECTURES)
       list(APPEND MI_OPT_ARCH_FLAGS "-Xarch_arm64;-march=armv8.3-a")
     endif()
@@ -822,10 +917,21 @@ if(NOT MI_OPT_ARCH MATCHES "^(0|OFF|NO|FALSE|N)$")
   elseif(CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang|GNU|Intel" AND NOT CMAKE_SYSTEM_NAME MATCHES "Haiku")
     if(MI_OPT_ARCH STREQUAL "avx2")
       set(MI_OPT_ARCH_FLAGS "-march=haswell;-mavx2")      # fast bit scan (since 2013)
+      # avoid the Skylake JCC erratum
+      if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+        set(mi_jcc_flag "-mbranches-within-32B-boundaries")
+      else()
+        set(mi_jcc_flag "-Wa,-mbranches-within-32B-boundaries")
+      endif()
+      include(CheckCCompilerFlag)
+      check_c_compiler_flag("${mi_jcc_flag}" mi_has_jcc_flag)
+      if(mi_has_jcc_flag)
+        list(APPEND MI_OPT_ARCH_FLAGS "${mi_jcc_flag}")
+      endif()
     elseif(MI_OPT_ARCH MATCHES "^armv[89].*$")
       set(MI_OPT_ARCH_FLAGS "-march=${MI_OPT_ARCH}-a")    # fast atomics
     elseif(MI_OPT_ARCH MATCHES "^rva[0-9][0-9]$")
-      set(MI_OPT_ARCH_FLAGS "-march=${MI_OPT_ARCH}u${MI_ARCH_BITS}")      
+      set(MI_OPT_ARCH_FLAGS "-march=${MI_OPT_ARCH}u${MI_ARCH_BITS}")
     elseif(MI_OPT_ARCH MATCHES "^rv.*$")
       set(MI_OPT_ARCH_FLAGS "-march=${MI_OPT_ARCH}")
     else()
@@ -837,8 +943,11 @@ if(NOT MI_OPT_ARCH MATCHES "^(0|OFF|NO|FALSE|N)$")
   elseif (MSVC AND MSVC_VERSION GREATER_EQUAL 1914 AND NOT MI_CLANG_CL) # vs2017+
     if(MI_OPT_ARCH STREQUAL "avx2")
       set(MI_OPT_ARCH_FLAGS "/arch:AVX2")
+      if(MSVC_VERSION GREATER_EQUAL 1925)                     # vs2019 16.5+
+        list(APPEND MI_OPT_ARCH_FLAGS "/QIntel-jcc-erratum")  # avoid the Skylake JCC erratum
+      endif()
     elseif(MI_OPT_ARCH MATCHES "^armv[89].*$")
-      set(MI_OPT_ARCH_FLAGS "/arch:${MI_OPT_ARCH}")       # fast atomics
+      set(MI_OPT_ARCH_FLAGS "/arch:${MI_OPT_ARCH}")           # fast atomics
     else()
       message(STATUS "warning: unknown MI_OPT_ARCH=${MI_OPT_ARCH} passed as '/arch:${MI_OPT_ARCH}'")
     endif()
@@ -898,11 +1007,14 @@ else()
     list(APPEND mi_libraries "${MI_LIB_ATOMIC}")
   endif()
 endif()
+if(EMSCRIPTEN)
+  list(APPEND mi_libraries -sALLOW_MEMORY_GROWTH=1)  # mimalloc reserves memory in large chunks
+endif()
 
 # set language for source files now
 if(MI_USE_CXX)
   set_source_files_properties(${mi_sources} PROPERTIES LANGUAGE CXX )
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-arena.c test/test-bitmap.c test/test-qsbr.c test/test-stress.c test/test-stress-heaps.c  test/test-stress-subprocs.c test/test-stress-pprof.c test/test-profile.c test/test-pprof.c test/test-fork.c PROPERTIES LANGUAGE CXX )
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-arena.c test/test-bitmap.c test/test-qsbr.c test/test-stress.c test/test-stress-heaps.c  test/test-stress-subprocs.c test/test-stress-pprof.c test/test-profile.c test/test-pprof.c test/test-fork.c test/test-secure.c PROPERTIES LANGUAGE CXX )
 endif()
 
 # platform specific headers that are only needed for profiling support
@@ -911,40 +1023,53 @@ if(NOT WIN32 AND MI_PROFILE)
   if(MI_HAS_UNISTDH)
     list(APPEND mi_defines MI_HAS_UNISTDH=1)
   endif()
-  CHECK_INCLUDE_FILES("execinfo.h" MI_HAS_EXECINFOH)
-  if(MI_HAS_EXECINFOH) 
-    list(APPEND mi_defines MI_HAS_EXECINFOH=1)    
+  # Check that `backtrace` is declared and linkable, not just that `execinfo.h` exists (e.g. on Android `backtrace` is only available from API level 33).
+  check_symbol_exists(backtrace "execinfo.h" MI_HAS_BACKTRACE)
+  if(NOT MI_HAS_BACKTRACE AND CMAKE_SYSTEM_NAME MATCHES "BSD|DragonFly")
     # On FreeBSD (and some other BSDs) `backtrace`/`backtrace_symbols` are not part of
     # libc but live in a separate `libexecinfo` that must be linked explicitly.
-    if(CMAKE_SYSTEM_NAME MATCHES "BSD|DragonFly")
-      find_link_library("execinfo" MI_LIB_EXECINFO)
-      if(MI_LIB_EXECINFO)
+    find_link_library("execinfo" MI_LIB_EXECINFO)
+    if(MI_LIB_EXECINFO)
+      check_symbol_exists_with_libs(backtrace "execinfo.h" "${MI_LIB_EXECINFO}" MI_HAS_BACKTRACE_WITH_EXECINFO)
+      if(MI_HAS_BACKTRACE_WITH_EXECINFO)
+        set(MI_HAS_BACKTRACE ON)
         list(APPEND mi_libraries "${MI_LIB_EXECINFO}")
-      endif()
-    endif()    
-  else()
-    # No `execinfo.h` available (e.g. musl-based Linux distributions such as Alpine
-    # do not implement `backtrace`); fall back to `libunwind` if it is installed.
-    CHECK_INCLUDE_FILES("libunwind.h" MI_HAS_LIBUNWINDH)
-    if(MI_HAS_LIBUNWINDH)
-      find_link_library("unwind" MI_LIB_UNWIND)
-      if(MI_LIB_UNWIND)
-        list(APPEND mi_defines MI_HAS_LIBUNWINDH=1)
-        list(APPEND mi_libraries "${MI_LIB_UNWIND}")
-      endif()
-    else()
-      message(WARNING "No backtrace support available: neither execinfo.h nor libunwind.h found.")
-      if(EXISTS "/etc/alpine-release")
-        message(STATUS "(On Alpine Linux, use `apk add libunwind-dev` to add the libunwind library)")
       endif()
     endif()
   endif()
-  # FreeBSD (and DragonFly) need `kinfo_getvmmap` (in `libutil`) to collect the
-  # process's memory mappings (used for module/library info in dumped profiles).
-  if(CMAKE_SYSTEM_NAME MATCHES "FreeBSD|DragonFly")
-    find_link_library("util" MI_LIB_UTIL)
-    if(MI_LIB_UTIL)
-      list(APPEND mi_libraries "${MI_LIB_UTIL}")
+  if(MI_HAS_BACKTRACE)
+    list(APPEND mi_defines MI_HAS_EXECINFOH=1)
+  else()
+    # No usable `backtrace` available (e.g. Android before API level 33, or musl-based Linux
+    # distributions such as Alpine); fall back to `_Unwind_Backtrace` from `unwind.h`
+    # which is provided by the compiler's unwinder (libgcc_s or LLVM libunwind).
+    include(CheckCSourceCompiles)
+    set(mi_unwind_test_source "
+      #include <unwind.h>
+      #include <stdint.h>
+      static _Unwind_Reason_Code mi_unwind_test(struct _Unwind_Context* ctx, void* arg) {
+        *(uintptr_t*)arg = (uintptr_t)_Unwind_GetIP(ctx);
+        return _URC_END_OF_STACK;
+      }
+      int main(void) { uintptr_t ip = 0; _Unwind_Backtrace(&mi_unwind_test, &ip); return (ip == 0); }")
+    check_c_source_compiles("${mi_unwind_test_source}" MI_HAS_UNWINDH)
+    if(NOT MI_HAS_UNWINDH)
+      foreach(mi_unwind_lib IN ITEMS gcc_s unwind)
+        cmake_push_check_state()
+        list(APPEND CMAKE_REQUIRED_LIBRARIES ${mi_unwind_lib})
+        check_c_source_compiles("${mi_unwind_test_source}" MI_HAS_UNWINDH_${mi_unwind_lib})
+        cmake_pop_check_state()
+        if(MI_HAS_UNWINDH_${mi_unwind_lib})
+          set(MI_HAS_UNWINDH ON)
+          list(APPEND mi_libraries ${mi_unwind_lib})
+          break()
+        endif()
+      endforeach()
+    endif()
+    if(MI_HAS_UNWINDH)
+      list(APPEND mi_defines MI_HAS_UNWINDH=1)
+    else()
+      message(WARNING "No backtrace support available: neither backtrace (execinfo.h) nor _Unwind_Backtrace (unwind.h) usable.")
     endif()
   endif()
 endif()
@@ -970,6 +1095,9 @@ else()
 endif()
 
 set(mi_libname "mimalloc")
+if(MI_MTE)
+  set(mi_libname "${mi_libname}-mte")
+endif()
 if(MI_SECURE)
   set(mi_libname "${mi_libname}-secure")
 endif()
@@ -1049,6 +1177,9 @@ if(MI_BUILD_SHARED)
   target_compile_definitions(mimalloc PRIVATE ${mi_defines} MI_SHARED_LIB MI_SHARED_LIB_EXPORT)
   target_compile_options(mimalloc PRIVATE ${mi_cflags} ${mi_cflags_dynamic})
   target_link_libraries(mimalloc PRIVATE ${mi_libraries})
+  if(EMSCRIPTEN)
+    target_link_options(mimalloc PRIVATE -Wno-pthreads-mem-growth)
+  endif()
   target_include_directories(mimalloc PUBLIC
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
       $<INSTALL_INTERFACE:${mi_install_incdir}>
@@ -1195,12 +1326,38 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/mimalloc.pc"
 if (MI_BUILD_TESTS)
   enable_testing()
 
+  # run tests through the emulator when cross compiling (e.g. `node` for emscripten)
+  set(mi_test_runner ${CMAKE_CROSSCOMPILING_EMULATOR})
+
+  # on macOS, MTE is only enabled for processes signed with the hardened-process entitlements (ignored if the hardware has no MTE)
+  set(mi_test_mte_sign OFF)
+  if(APPLE AND MI_MTE AND MI_ARCH STREQUAL "arm64")
+    find_program(MI_CODESIGN codesign)
+    if(MI_CODESIGN)
+      message(STATUS "Sign test executables to enable memory tagging (MTE)")
+      set(mi_test_mte_sign ON)
+    endif()
+  endif()
+  function(mi_test_sign target)
+    if(mi_test_mte_sign)
+      add_custom_command(TARGET ${target} POST_BUILD COMMAND ${MI_CODESIGN} -s - -f --entitlements ${CMAKE_CURRENT_SOURCE_DIR}/cmake/mte-entitlements.plist $<TARGET_FILE:${target}>)
+    endif()
+  endfunction()
+
+  if(EMSCRIPTEN)
+    add_link_options(-sNODE_HOST_ENV=1)  # pass environment variables
+    if(CMAKE_C_FLAGS MATCHES "-pthread")
+      add_link_options(-pthread -sPTHREAD_POOL_SIZE=40 -Wno-pthreads-mem-growth)  # pre-spawn workers so threads can start while main blocks
+    endif()
+  endif()
+
   # static link tests
-  foreach(TEST_NAME api api-fill arena bitmap stress-heaps stress-subprocs stress stress-pprof profile pprof fork)
-    if((TEST_NAME STREQUAL "arena" OR TEST_NAME STREQUAL "bitmap") AND (NOT MI_BUILD_STATIC OR MI_DEBUG_TSAN))
+  foreach(TEST_NAME api api-fill arena bitmap secure stress-heaps stress-subprocs stress stress-pprof profile pprof fork)
+    if((TEST_NAME STREQUAL "arena" OR TEST_NAME STREQUAL "bitmap" OR TEST_NAME STREQUAL "secure") AND (NOT MI_BUILD_STATIC OR MI_DEBUG_TSAN))
       continue()
     endif()
     add_executable(mimalloc-test-${TEST_NAME} test/test-${TEST_NAME}.c)
+    mi_test_sign(mimalloc-test-${TEST_NAME})
     target_compile_definitions(mimalloc-test-${TEST_NAME} PRIVATE ${mi_defines})
     target_compile_options(mimalloc-test-${TEST_NAME} PRIVATE ${mi_cflags})
     target_include_directories(mimalloc-test-${TEST_NAME} PRIVATE include)
@@ -1218,13 +1375,17 @@ if (MI_BUILD_TESTS)
     if(MI_DEBUG_TSAN AND TEST_NAME STREQUAL "fork")
     # don't add as a test
     elseif(MI_GUARDED AND NOT (TEST_NAME STREQUAL "profile" OR TEST_NAME STREQUAL "pprof" OR TEST_NAME STREQUAL "stress-pprof"))
-    add_test(NAME test-${TEST_NAME} COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_GUARDED_SAMPLE_RATE=1024 $<TARGET_FILE:mimalloc-test-${TEST_NAME}>)
+    add_test(NAME test-${TEST_NAME} COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_GUARDED_SAMPLE_RATE=1024 ${mi_test_runner} $<TARGET_FILE:mimalloc-test-${TEST_NAME}>)
     elseif(TEST_NAME STREQUAL "stress-heaps")
-    add_test(NAME test-${TEST_NAME} COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_ARENA_EAGER_COMMIT=0 MIMALLOC_PAGE_COMMIT_ON_DEMAND=0 $<TARGET_FILE:mimalloc-test-${TEST_NAME}>)
+    add_test(NAME test-${TEST_NAME} COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_ARENA_EAGER_COMMIT=0 MIMALLOC_PAGE_COMMIT_ON_DEMAND=0 ${mi_test_runner} $<TARGET_FILE:mimalloc-test-${TEST_NAME}>)
     elseif((NOT MI_PROFILE) AND (TEST_NAME STREQUAL "profile" OR TEST_NAME STREQUAL "pprof" OR TEST_NAME STREQUAL "stress-pprof"))
     # don't add as a test
-    elseif(NOT APPLE AND (TEST_NAME STREQUAL "pprof" OR TEST_NAME STREQUAL "stress-pprof"))
-    # don't add as a test
+    elseif(NOT APPLE AND TEST_NAME STREQUAL "stress-pprof")
+    # don't add as a test (stress-pprof is only run on macOS so far)
+    elseif(TEST_NAME STREQUAL "pprof" AND NOT APPLE AND NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+    # don't add as a test on platforms where the pprof test is not verified yet
+    elseif(TEST_NAME STREQUAL "pprof" AND MI_ARCH STREQUAL "arm32")
+    # don't add as a test on arm32 (C code has no unwind tables by default so backtraces are empty)
     else()
     add_test(NAME test-${TEST_NAME} COMMAND mimalloc-test-${TEST_NAME})
     endif()
@@ -1233,23 +1394,25 @@ if (MI_BUILD_TESTS)
   # static override test
   if(MI_BUILD_OBJECT AND MI_OVERRIDE AND NOT (MI_CYGWIN OR (MI_TRACK STREQUAL "ASAN") OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN))
     add_executable(mimalloc-test-stress-static test/test-stress.c)
+    mi_test_sign(mimalloc-test-stress-static)
     target_compile_definitions(mimalloc-test-stress-static PRIVATE ${mi_defines} "USE_STD_MALLOC=1")
     target_compile_options(mimalloc-test-stress-static PRIVATE ${mi_cflags})
     target_include_directories(mimalloc-test-stress-static PRIVATE include)
     target_link_libraries(mimalloc-test-stress-static PRIVATE mimalloc-obj  ${mi_libraries})  # override statically with an object file
-    add_test(NAME test-stress-static COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_VERBOSE=1 MIMALLOC_SHOW_STATS=1 $<TARGET_FILE:mimalloc-test-stress-static>)
+    add_test(NAME test-stress-static COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_VERBOSE=1 MIMALLOC_SHOW_STATS=1 ${mi_test_runner} $<TARGET_FILE:mimalloc-test-stress-static>)
   endif()
 
   # dynamic override test
-  if(MI_BUILD_SHARED AND MI_OVERRIDE AND NOT (MI_CYGWIN OR (MI_TRACK STREQUAL "ASAN") OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN)) # AND NOT (APPLE AND MI_USE_CXX))
+  if(MI_BUILD_SHARED AND MI_OVERRIDE AND NOT (EMSCRIPTEN OR MI_CYGWIN OR (MI_TRACK STREQUAL "ASAN") OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN)) # AND NOT (APPLE AND MI_USE_CXX))
     add_executable(mimalloc-test-stress-dynamic test/test-stress.c)
+    mi_test_sign(mimalloc-test-stress-dynamic)
     target_compile_definitions(mimalloc-test-stress-dynamic PRIVATE ${mi_defines} "USE_STD_MALLOC=1")
     target_compile_options(mimalloc-test-stress-dynamic PRIVATE ${mi_cflags})
     target_include_directories(mimalloc-test-stress-dynamic PRIVATE include)
     if(WIN32)
       target_compile_definitions(mimalloc-test-stress-dynamic PRIVATE "MI_LINK_VERSION=1")  # link mi_version
       target_link_libraries(mimalloc-test-stress-dynamic PRIVATE mimalloc ${mi_libraries})  # link mi_version
-      if(MI_MINGW_UCRT64)
+      if(MINGW AND MI_MINGW_UCRT AND MI_WIN_REDIRECT AND CMAKE_HOST_WIN32)
         # mingw always links mimalloc after system libraries.
         # post-process with `minject` to make sure mimalloc is the first dll in the load order.
         add_custom_command(TARGET mimalloc-test-stress-dynamic POST_BUILD COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/bin/minject${MINJECT_SUFFIX} --postfix=${mi_libsuffix} -f -i $<TARGET_FILE:mimalloc-test-stress-dynamic>)
@@ -1262,21 +1425,42 @@ if (MI_BUILD_TESTS)
       else()
         set(LD_PRELOAD "LD_PRELOAD")
       endif()
-      add_test(NAME test-stress-dynamic COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_VERBOSE=1 ${LD_PRELOAD}=$<TARGET_FILE:mimalloc> $<TARGET_FILE:mimalloc-test-stress-dynamic>)
+      if(mi_test_runner MATCHES "qemu")
+        # pass the preload to the emulated program only (and not to QEMU itself)
+        add_test(NAME test-stress-dynamic COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_VERBOSE=1 ${mi_test_runner} -E ${LD_PRELOAD}=$<TARGET_FILE:mimalloc> $<TARGET_FILE:mimalloc-test-stress-dynamic>)
+      else()
+        add_test(NAME test-stress-dynamic COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_VERBOSE=1 ${LD_PRELOAD}=$<TARGET_FILE:mimalloc> ${mi_test_runner} $<TARGET_FILE:mimalloc-test-stress-dynamic>)
+      endif()
     endif()
   endif()
 
-  # The QSBR adapter embeds its own allocator with an extended internal layout.
+  # Check QSBR
   add_executable(mimalloc-test-qsbr test/test-qsbr.c)
+  mi_test_sign(mimalloc-test-qsbr)
   target_compile_definitions(mimalloc-test-qsbr PRIVATE ${mi_defines})
   target_compile_options(mimalloc-test-qsbr PRIVATE ${mi_cflags})
   target_include_directories(mimalloc-test-qsbr PRIVATE include)
   target_link_libraries(mimalloc-test-qsbr PRIVATE ${mi_libraries})
   add_test(NAME test-qsbr COMMAND mimalloc-test-qsbr)
 
+  # Check that memory tagging catches invalid accesses
+  if(MI_MTE AND MI_ARCH STREQUAL "arm64" AND NOT WIN32)
+    add_executable(mimalloc-test-mte test/test-mte.c)
+    mi_test_sign(mimalloc-test-mte)
+    target_compile_definitions(mimalloc-test-mte PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-mte PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-mte PRIVATE include)
+    if(MI_BUILD_STATIC)
+      target_link_libraries(mimalloc-test-mte PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-mte PRIVATE mimalloc ${mi_libraries})
+    endif()
+    add_test(NAME test-mte COMMAND mimalloc-test-mte)
+  endif()
+
   # Rust crate tests (only if `cargo` is available)
   find_program(MI_CARGO cargo HINTS "$ENV{CARGO_HOME}/bin" "$ENV{HOME}/.cargo/bin")
-  if(MI_CARGO AND NOT (MI_DEBUG_TSAN OR MI_DEBUG_UBSAN OR (MI_TRACK STREQUAL "ASAN")))
+  if(MI_CARGO AND NOT (CMAKE_CROSSCOMPILING OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN OR (MI_TRACK STREQUAL "ASAN")))
     message(STATUS "Add Rust crate tests (using ${MI_CARGO})")
     set(mi_cargo_args test --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/contrib/rust/Cargo.toml"
                            --target-dir "${CMAKE_CURRENT_BINARY_DIR}/rust" "$<IF:$<CONFIG:Debug>,--features=debug,--release>")
@@ -1286,7 +1470,27 @@ if (MI_BUILD_TESTS)
     if(MI_OPT_ARCH)
       list(APPEND mi_cargo_args --features=opt_arch)
     endif()
+    if(NOT WIN32 AND "MI_MTE=2" IN_LIST mi_defines)
+      list(APPEND mi_cargo_args --features=mte)
+    endif()
+    if(NOT WIN32 AND "MI_PAC=2" IN_LIST mi_defines)
+      list(APPEND mi_cargo_args --features=pac)
+    endif()
+    # pass the exact security levels (like `MI_SECURE=2` or `MI_MTE=1`) that have no corresponding feature
+    set(mi_cargo_defines "")
+    foreach(mi_define IN LISTS mi_defines)
+      if(mi_define MATCHES "^MI_(SECURE|SECURE_ENV|MTE|PAC)=")
+        string(APPEND mi_cargo_defines " ${mi_define}")
+      endif()
+    endforeach()
+    set(mi_cargo_env "MIMALLOC_DEFINES=${mi_cargo_defines}")
+    if(mi_test_mte_sign)
+      # sign the test executables to enable MTE (and skip the doc tests as these cannot be signed)
+      list(APPEND mi_cargo_args --lib --tests)
+      list(APPEND mi_cargo_env "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER=${CMAKE_CURRENT_SOURCE_DIR}/cmake/mte-run.sh")
+    endif()
     add_test(NAME test-rust COMMAND ${MI_CARGO} ${mi_cargo_args})
+    set_tests_properties(test-rust PROPERTIES ENVIRONMENT "${mi_cargo_env}")
   endif()
 endif()
 

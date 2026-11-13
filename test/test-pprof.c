@@ -28,6 +28,18 @@ terms of the MIT license. A copy of the license can be found in the file
 // ---------------------------------------------------------------------------
 
 #define TEST_THRESHOLD (1 * 1024)
+
+// with `MI_TEST_LIGHT` use fewer allocations (and thus fewer sampled backtraces)
+#if MI_TEST_LIGHT >= 2
+#define TEST_ALLOC_COUNT      (10000)
+#define TEST_SITE_ALLOC_COUNT (2000)
+#elif MI_TEST_LIGHT
+#define TEST_ALLOC_COUNT      (20000)
+#define TEST_SITE_ALLOC_COUNT (4000)
+#else
+#define TEST_ALLOC_COUNT      (200000)
+#define TEST_SITE_ALLOC_COUNT (20000)
+#endif
 #define PROFILE_BASE_NAME "profile/test-pprof-profile"
 
 // Build the name of the `seq`-th snapshot file for `base`, matching the
@@ -72,8 +84,17 @@ static void allocate_and_free(size_t n, size_t block_size) {
 // fewer distinct ones (or even just one).
 static void* volatile mi_test_pprof_sink;
 
+// Prevent inlining of the sites (as that would also collapse the backtraces).
+#if defined(_MSC_VER)
+#define mi_test_noinline  __declspec(noinline)
+#elif defined(__GNUC__)
+#define mi_test_noinline  __attribute__((noinline))
+#else
+#define mi_test_noinline
+#endif
+
 #define MI_TEST_PPROF_DEFINE_SITE(N) \
-  static void* alloc_site_##N(size_t block_size, size_t i) { \
+  static mi_test_noinline void* alloc_site_##N(size_t block_size, size_t i) { \
     void* p = mi_malloc(block_size + (i % 37)); \
     mi_test_pprof_sink = p; \
     return p; \
@@ -159,7 +180,7 @@ static size_t count_location_entries(const char* contents) {
 }
 
 // Parse the total inuse object count from the pprof header line, i.e. the
-// first number in `heap profile: <inuse_objects>: <inuse_bytes> [...] @ heapprofile`.
+// first number in `heap profile: <inuse_objects>: <inuse_bytes> [...] @ heap_v2/<rate>`.
 static int64_t parse_total_inuse_objects(const char* contents) {
   const char* p = (contents == NULL ? NULL : strstr(contents, "heap profile:"));
   if (p == NULL) return -1;
@@ -196,7 +217,7 @@ bool test_pprof_snapshot_creates_file(void) {
     if (result) {
       mi_profile(prof);
       mi_profiler_start(prof);
-      allocate_and_free(200000, 64);
+      allocate_and_free(TEST_ALLOC_COUNT, 64);
       mi_profiler_stop(prof);
 
       mi_profiler_snapshot(prof);
@@ -223,7 +244,7 @@ bool test_pprof_snapshot_format(void) {
     if (result) {
       mi_profile(prof);
       mi_profiler_start(prof);
-      allocate_and_free(200000, 64);
+      allocate_and_free(TEST_ALLOC_COUNT, 64);
       mi_profiler_stop(prof);
 
       mi_profiler_snapshot(prof);
@@ -233,7 +254,7 @@ bool test_pprof_snapshot_format(void) {
       char* contents = read_file(fname);
       result = (contents != NULL &&
                 strncmp(contents, "heap profile:", 13) == 0 &&
-                strstr(contents, "@ heapprofile") != NULL &&
+                strstr(contents, "@ heap_v2/") != NULL &&
                 strstr(contents, "MAPPED_LIBRARIES:") != NULL);
       mi_free(contents);
 
@@ -260,6 +281,35 @@ static uint64_t pb_read_varint(const uint8_t** p, const uint8_t* end) {
   return v;
 }
 
+#if defined(__linux__)
+static bool pb_mapping_matches_file_offset(const uint8_t* p, const uint8_t* end) {
+  uint64_t start = 0, limit = 0, offset = 0;
+  while (p < end) {
+    const uint64_t tag = pb_read_varint(&p, end);
+    if ((tag & 7) != 0) return false;
+    const uint64_t value = pb_read_varint(&p, end);
+    if ((tag >> 3) == 2) start = value;
+    if ((tag >> 3) == 3) limit = value;
+    if ((tag >> 3) == 4) offset = value;
+  }
+  if (offset == 0) return false;
+  FILE* maps = fopen("/proc/self/maps", "r");
+  if (maps == NULL) return false;
+  char line[1024];
+  bool matched = false;
+  while (fgets(line, sizeof(line), maps) != NULL) {
+    unsigned long long map_start, map_limit, map_offset;
+    if (sscanf(line, "%llx-%llx %*s %llx", &map_start, &map_limit, &map_offset) == 3 &&
+        map_start == start && map_limit == limit && map_offset == offset) {
+      matched = true;
+      break;
+    }
+  }
+  fclose(maps);
+  return matched;
+}
+#endif
+
 // A very small sanity check that the captured bytes are plausible protobuf: no
 // C-side protobuf parser is available, so we just walk the top-level
 // `(tag, value)` pairs and check they are well-formed and that at least one
@@ -270,6 +320,9 @@ static bool pb_looks_like_valid_profile(const uint8_t* data, size_t size) {
   const uint8_t* end = data + size;
   bool saw_sample = false;
   bool saw_location = false;
+  #if defined(__linux__)
+  bool saw_file_offset = false;
+  #endif
   while (p < end) {
     const uint64_t tag = pb_read_varint(&p, end);
     const uint32_t field = (uint32_t)(tag >> 3);
@@ -282,12 +335,18 @@ static bool pb_looks_like_valid_profile(const uint8_t* data, size_t size) {
     else if (wiretype == 2) {   // length-delimited
       const uint64_t len = pb_read_varint(&p, end);
       if ((size_t)(end - p) < len) return false;
+      #if defined(__linux__)
+      if (field == 3 && pb_mapping_matches_file_offset(p, p + len)) saw_file_offset = true;
+      #endif
       p += len;
     }
     else {
       return false;  // no other wiretypes are used by this writer
     }
   }
+  #if defined(__linux__)
+  if (!saw_file_offset) return false;
+  #endif
   return (p == end && saw_sample && saw_location);
 }
 
@@ -301,7 +360,7 @@ bool test_pprof_snapshot_proto_format(void) {
     if (result) {
       mi_profile(prof);
       mi_profiler_start(prof);
-      allocate_and_free(200000, 64);
+      allocate_and_free(TEST_ALLOC_COUNT, 64);
       mi_profiler_stop(prof);
 
       mi_profiler_snapshot(prof);
@@ -345,7 +404,7 @@ bool test_pprof_snapshot_interval(void) {
       // note: `mi_profiler_snapshot` is never called explicitly here -- any
       // snapshot files that appear must have been triggered automatically by
       // `on_alloc` once `TEST_INTERVAL_SIZE` sampled bytes have accumulated.
-      allocate_and_free(200000, 64);
+      allocate_and_free(TEST_ALLOC_COUNT, 64);
       mi_profiler_stop(prof);
 
       // the first snapshot should exist...
@@ -392,9 +451,9 @@ bool test_pprof_snapshot_records_samples(void) {
       mi_profiler_start(prof);
       // allocate plenty from each of the 10 distinct call sites so every
       // site accumulates enough bytes to trigger at least one sample.
-      allocate_and_free_multi_site(prof, 20000, 64);
+      allocate_and_free_multi_site(prof, TEST_SITE_ALLOC_COUNT, 64);
       mi_profiler_snapshot(prof);
-      allocate_and_free_multi_site(prof, 20000, 64);
+      allocate_and_free_multi_site(prof, TEST_SITE_ALLOC_COUNT, 64);
       mi_profiler_snapshot(prof);
       allocate_and_free_multi_site_cleanup();  // free any allocations still kept alive by the ring buffers
       mi_profiler_snapshot(prof);  // final snapshot, taken after everything was freed
@@ -487,7 +546,13 @@ bool test_pprof_profiler_new_delete(void) {
 
 #define PROFILE_THREADS_BASE_NAME  "profile/test-pprof-profile-threads"
 #define MI_TEST_PPROF_THREAD_COUNT      8
+#if MI_TEST_LIGHT >= 2
+#define MI_TEST_PPROF_THREAD_ITERS      5000
+#elif MI_TEST_LIGHT
+#define MI_TEST_PPROF_THREAD_ITERS      10000
+#else
 #define MI_TEST_PPROF_THREAD_ITERS      50000
+#endif
 #define MI_TEST_PPROF_THREAD_POOL_SIZE  1024
 // number of snapshot files to retain: 3 taken while threads are running, plus 1 final one
 #define MI_TEST_PPROF_THREAD_SNAPSHOT_COUNT 4
@@ -597,6 +662,119 @@ bool test_pprof_concurrent_threads(void) {
 #endif // !defined(_WIN32)
 
 // ---------------------------------------------------------------------------
+// Allocation failure: exhaust the mimalloc arenas (with OS allocation
+// disabled) and then drain the profiler's own heap by creating many distinct
+// sampled call stacks. Every following allocation from the profiler heap must
+// then fail, so taking a snapshot exercises the out-of-memory paths
+// deterministically: it must neither crash nor leave a partial snapshot file.
+// Linux only for now: the arena exhaustion below is verified on Linux, and the
+// pprof test is also run on macOS where it has not been verified yet.
+// ---------------------------------------------------------------------------
+#if defined(__linux__)
+
+#define PPROF_OOM_BASE_NAME       "profile/test-pprof-oom"
+#define PPROF_OOM_MAX_BLOCKS      (60000)
+#define PPROF_OOM_RECURSION_DEPTH (120)
+#define PPROF_OOM_RECURSION_REPS  (4)
+
+static void* pprof_oom_blocks[PPROF_OOM_MAX_BLOCKS];
+static void* volatile pprof_oom_sink;
+
+// Four distinct recursive allocation sites: each recursion depth produces a
+// different (truncated) call stack, so sampling them creates many distinct
+// locations -- and thus many allocations -- in the profiler's own heap.
+#define PPROF_OOM_DEFINE_RECURSION(N) \
+  static void pprof_oom_rec_##N(size_t depth) { \
+    void* p = mi_malloc(24 + (depth & 31)); \
+    pprof_oom_sink = p; \
+    if (depth < PPROF_OOM_RECURSION_DEPTH) { pprof_oom_rec_##N(depth + 1); } \
+    mi_free(p); \
+  }
+
+PPROF_OOM_DEFINE_RECURSION(0)
+PPROF_OOM_DEFINE_RECURSION(1)
+PPROF_OOM_DEFINE_RECURSION(2)
+PPROF_OOM_DEFINE_RECURSION(3)
+
+// Returns the size of `fname`, or -1 if it does not exist.
+static long file_size(const char* fname) {
+  FILE* f = fopen(fname, "rb");
+  if (f == NULL) return -1;
+  fseek(f, 0, SEEK_END);
+  const long size = ftell(f);
+  fclose(f);
+  return size;
+}
+
+bool test_pprof_snapshot_oom(void) {
+  CHECK_BODY("pprof: snapshot degrades gracefully when profiler allocations fail") {
+    char proto_fname[1024];
+    snprintf(proto_fname, sizeof(proto_fname), "%s.0001.pb", PPROF_OOM_BASE_NAME);
+    char recovery_fname[1024];
+    snprintf(recovery_fname, sizeof(recovery_fname), "%s.0002.pb", PPROF_OOM_BASE_NAME);
+    remove(proto_fname);
+    remove(recovery_fname);
+
+    // sample every allocation so the recursion below creates a location per depth
+    mi_profiler_t* prof = mi_pprof_profiler_new(1, PPROF_OOM_BASE_NAME, 0, 0, 0);
+    result = (prof != NULL);
+    if (result) {
+      mi_profile(prof);
+      mi_profiler_start(prof);
+
+      // the failures below are expected: do not print them
+      const long old_show_errors = mi_option_get(mi_option_show_errors);
+      mi_option_set(mi_option_show_errors, 0);
+
+      // 1. exhaust the arenas: from now on no new pages can be allocated
+      mi_option_set(mi_option_disallow_os_alloc, 1);
+      //    (with decreasing block sizes as the remaining fragments may still fit smaller pages)
+      size_t block_count = 0;
+      for (size_t block_size = 64 * 1024; block_size >= 1024; block_size /= 4) {
+        while (block_count < PPROF_OOM_MAX_BLOCKS) {
+          void* b = mi_malloc(block_size);
+          if (b == NULL) break;
+          pprof_oom_blocks[block_count++] = b;
+        }
+      }
+      result = (block_count > 0 && block_count < PPROF_OOM_MAX_BLOCKS);
+
+      // 2. drain the profiler heap's remaining free space: these allocations
+      //    still fit in its current pages, so they keep creating locations
+      //    until no room is left for another one.
+      for (size_t rep = 0; rep < PPROF_OOM_RECURSION_REPS; rep++) {
+        pprof_oom_rec_0(1);
+        pprof_oom_rec_1(1);
+        pprof_oom_rec_2(1);
+        pprof_oom_rec_3(1);
+      }
+
+      // 3. the snapshot cannot allocate: it must return normally and leave no file
+      mi_profiler_snapshot(prof);
+      result = result && (file_size(proto_fname) < 0);
+
+      // 4. restore memory and check that snapshots work again
+      for (size_t i = 0; i < block_count; i++) { mi_free(pprof_oom_blocks[i]); }
+      block_count = 0;
+      mi_option_set(mi_option_disallow_os_alloc, 0);
+      mi_option_set(mi_option_show_errors, old_show_errors);
+
+      allocate_and_free(20000, 64);
+      mi_profiler_snapshot(prof);
+      result = result && (file_size(recovery_fname) > 0);
+
+      remove(proto_fname);
+      remove(recovery_fname);
+      mi_profile(NULL);
+      mi_pprof_profiler_delete(prof);
+    }
+  }
+  return true;
+}
+
+#endif // defined(__linux__)
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -612,6 +790,10 @@ int main(void) {
 #if !defined(_WIN32)
   // this test also leaves its pprof files
   test_pprof_concurrent_threads();
+#endif
+#if defined(__linux__)
+  // last: this one deliberately exhausts the allocator before restoring it
+  test_pprof_snapshot_oom();
 #endif
   return print_test_summary();
 }

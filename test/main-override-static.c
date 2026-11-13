@@ -50,7 +50,7 @@ int main() {
   // double_free1();
   // double_free2();
   // corrupt_free();
-  // invalid_free();  
+  // invalid_free();
   // block_overflow1();
   // block_overflow2();
   // test_canary_leak();
@@ -346,7 +346,7 @@ static void test_large_pages(void) {
 #if 0
 #include <stdint.h>
 #include <stdbool.h>
-#include <mimalloc/bits.h>
+#include <mimalloc/arch.h>
 
 #define MI_LARGE_WSIZE_MAX (4*1024*1024 / MI_SIZE_SIZE)
 

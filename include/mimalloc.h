@@ -8,7 +8,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #ifndef MIMALLOC_H
 #define MIMALLOC_H
 
-#define MI_MALLOC_VERSION 30600   // major + 2 digits minor + 2 digits patch
+#define MI_MALLOC_VERSION 30602   // major + 2 digits minor + 2 digits patch
 
 // ------------------------------------------------------
 // Compiler specific attributes
@@ -139,13 +139,16 @@ mi_decl_export void mi_free_size(void* p, size_t size) mi_attr_noexcept;
 
 // `mi_free_small` is for special applications like language runtimes.
 // it should only be used to free objects from `mi_*alloc_small` and is potentially a tiny bit faster than `mi_free`
-mi_decl_export void mi_free_small(void* p) mi_attr_noexcept;  
+mi_decl_export void mi_free_small(void* p) mi_attr_noexcept;
 
 // As `mi_free_small` but `p` should not be a NULL pointer.
 mi_decl_export void mi_free_small_nonnull(void* p) mi_attr_noexcept;
 
-// For runtime's: return the current owner thread-id of the page containing an allocation.
-mi_decl_nodiscard mi_decl_export size_t mi_thread_id_of(const void* p) mi_attr_noexcept;
+mi_decl_export void mi_free_size_aligned(void* p, size_t size, size_t alignment) mi_attr_noexcept;
+mi_decl_export void mi_free_aligned(void* p, size_t alignment)                   mi_attr_noexcept;
+
+// Checked free: always checks the pointer is valid before free-ing (and otherwise ignores the pointer)
+mi_decl_export bool mi_cfree(void* p) mi_attr_noexcept;
 
 
 // -------------------------------------------------------------------------------------
@@ -244,8 +247,10 @@ typedef struct mi_heap_s mi_heap_t;
 
 mi_decl_nodiscard mi_decl_export mi_heap_t* mi_heap_new(void);
 
-mi_decl_export void mi_heap_delete(mi_heap_t* heap);            // move live blocks to the main heap 
+mi_decl_export void mi_heap_delete(mi_heap_t* heap);            // move live blocks to the main heap
 mi_decl_export void mi_heap_destroy(mi_heap_t* heap);           // free all live blocks
+mi_decl_export void mi_thread_heap_release(mi_heap_t* heap) mi_attr_noexcept;  // the calling thread promises to no longer allocate in the heap (but blocks can still be freed)
+
 mi_decl_export void mi_heap_set_numa_affinity(mi_heap_t* heap, int numa_node);
 mi_decl_export void mi_heap_set_debug_fill_preserve(mi_heap_t* heap, size_t preserve); // in debug mode, do not fill the first `preserve` bytes of blocks on allocation or free
 mi_decl_export void mi_heap_collect(mi_heap_t* heap, bool force);
@@ -322,7 +327,8 @@ typedef struct mi_heap_area_s {
 
 typedef bool (mi_cdecl mi_block_visit_fun)(const mi_heap_t* heap, const mi_heap_area_t* area, void* block, size_t block_size, void* arg);
 
-// Heap visitors assume no concurrent heap access (except thread exit).
+// Heap visitors assume no concurrent heap access (except thread exit): no other thread may allocate in the heap,
+// or free blocks that belong to it, during the visit.
 mi_decl_export bool   mi_heap_visit_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg);
 mi_decl_export bool   mi_heap_visit_abandoned_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg);
 
@@ -402,6 +408,8 @@ mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_theap_malloc_aligned(
 mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_theap_zalloc_aligned(mi_theap_t* theap, size_t size, size_t alignment) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(2) mi_attr_alloc_align(3);
 mi_decl_nodiscard mi_decl_export                  void* mi_theap_realloc(mi_theap_t* theap, void* p, size_t newsize)              mi_attr_noexcept mi_attr_alloc_size(3);
 mi_decl_nodiscard mi_decl_export                  void* mi_theap_rezalloc(mi_theap_t* theap, void* p, size_t newsize)             mi_attr_noexcept mi_attr_alloc_size(3);
+mi_decl_nodiscard mi_decl_export                  void* mi_theap_realloc_aligned(mi_theap_t* theap, void* p, size_t newsize, size_t alignment)  mi_attr_noexcept mi_attr_alloc_size(3) mi_attr_alloc_align(4);
+mi_decl_nodiscard mi_decl_export                  void* mi_theap_rezalloc_aligned(mi_theap_t* theap, void* p, size_t newsize, size_t alignment) mi_attr_noexcept mi_attr_alloc_size(3) mi_attr_alloc_align(4);
 
 // ------------------------------------------------------
 // Experimental
@@ -434,6 +442,9 @@ mi_decl_export void mi_theap_delete(mi_theap_t* theap) mi_attr_noexcept;
 // Abandon all theap pages, preserving live blocks and the theap for reuse. The owner must be the current thread or quiescent outside mimalloc (excluding concurrent heap/theap deletion).
 mi_decl_export void mi_theap_quiescent_abandon(mi_theap_t* theap) mi_attr_noexcept;
 
+// For runtime's: return the current owner thread-id of the page containing an allocation.
+mi_decl_nodiscard mi_decl_export size_t mi_thread_id_of(const void* p) mi_attr_noexcept;
+
 
 // ------------------------------------------------------
 // Deprecated
@@ -457,6 +468,7 @@ mi_decl_export void mi_stats_print_out(mi_output_fun* out, void* arg) mi_attr_no
 
 // ------------------------------------------------------
 // Options
+// The deprecated options no longer have any effect.
 // ------------------------------------------------------
 
 typedef enum mi_option_e {
@@ -465,7 +477,7 @@ typedef enum mi_option_e {
   mi_option_show_stats,                 // print statistics on termination
   mi_option_verbose,                    // print verbose messages
   // advanced options
-  mi_option_deprecated_eager_commit,    
+  mi_option_deprecated_eager_commit,
   mi_option_arena_eager_commit,         // eager commit arenas? Use 2 to enable just on overcommit systems (=2)
   mi_option_purge_decommits,            // should a memory purge decommit? (=1). Set to 0 to use memory reset on a purge (instead of decommit)
   mi_option_allow_large_os_pages,       // allow use of large (2 or 4 MiB) OS pages, implies eager commit.
@@ -476,28 +488,28 @@ typedef enum mi_option_e {
   mi_option_deprecated_page_reset,
   mi_option_deprecated_abandoned_page_purge,
   mi_option_deprecated_segment_reset,
-  mi_option_deprecated_eager_commit_delay, 
+  mi_option_deprecated_eager_commit_delay,
   mi_option_purge_delay,                // memory purging is delayed by N milli seconds; use 0 for immediate purging or -1 for no purging at all. (=10)
   mi_option_use_numa_nodes,             // 0 = use all available numa nodes, otherwise use at most N nodes.
   mi_option_disallow_os_alloc,          // 1 = do not use OS memory for allocation (but only programmatically reserved arenas)
   mi_option_os_tag,                     // tag used for OS logging (macOS only for now) (=100)
   mi_option_max_errors,                 // issue at most N error messages
   mi_option_max_warnings,               // issue at most N warning messages
-  mi_option_deprecated_max_segment_reclaim,  // max. percentage of the abandoned segments can be reclaimed per try (=10%)
+  mi_option_deprecated_max_segment_reclaim,
   mi_option_destroy_on_exit,            // if set, release all memory on exit; sometimes used for dynamic unloading but can be unsafe
   mi_option_arena_reserve,              // initial memory size for arena reservation (= 1 GiB on 64-bit) (internally, this value is in KiB; use `mi_option_get_size`)
   mi_option_arena_purge_mult,           // multiplier for `purge_delay` for the purging delay for arenas (=10)
   mi_option_deprecated_purge_extend_delay,
   mi_option_disallow_arena_alloc,       // 1 = do not use arena's for allocation (except if using specific arena id's)
   mi_option_retry_on_oom,               // retry on out-of-memory for N milli seconds (=400), set to 0 to disable retries. (only on windows)
-  mi_option_deprecated_visit_abandoned, // allow visiting theap blocks from abandoned threads (=0)
+  mi_option_deprecated_visit_abandoned,
   mi_option_guarded_min,                // only used when building with MI_GUARDED: minimal rounded object size for guarded objects (=0)
   mi_option_guarded_max,                // only used when building with MI_GUARDED: maximal rounded object size for guarded objects (=0)
-  mi_option_unsafe_guarded_precise,     // disregard minimal alignment requirement to always place guarded blocks exactly in front of a guard page (=0)
+  mi_option_deprecated_unsafe_guarded_precise,     // deprecated (but can be enabled at build time with -DMI_UNSAFE_GUARDED_PRECISE=1)
   mi_option_guarded_sample_rate,        // guard an object in the min/max range about every N requested bytes (=0)
   mi_option_guarded_sample_seed,        // can be set to allow for a (more) deterministic re-execution when a guard page is triggered (=0)
   mi_option_generic_collect,            // collect theaps every N (=10000) generic allocation calls
-  mi_option_page_reclaim_on_free,       // heap-creation default for reclaim on free: -1 disallow, 0 originating theap only, 1 allow across theaps
+  mi_option_page_reclaim_on_free,       // heap-creation default for reclaim on free: -1 disallow, 0 originating theap only (default), 1 allow across theaps
   mi_option_page_full_retain,           // retain N full (small) pages per size class (=2)
   mi_option_page_max_candidates,        // max candidate pages to consider for allocation (=4)
   mi_option_max_vabits,                 // max user space virtual address bits to consider (=48)
@@ -507,15 +519,16 @@ typedef enum mi_option_e {
   mi_option_page_cross_thread_max_reclaim, // don't reclaim pages across threads if we already own N pages (in that size class) (=32)
   mi_option_allow_thp,                  // allow transparent huge pages? (=1) (on Android =0 by default). Set to 0 to disable THP for the process.
   mi_option_arena_purge_min_size,       // set minimal purge size (in KiB) (=0). By default set to either 64 or 2048 if THP is enabled.
-  mi_option_arena_max_object_size,      // set maximal object size that can be allocated in an arena (in KiB) (=2GiB on 64-bit). 
+  mi_option_arena_max_object_size,      // set maximal object size that can be allocated in an arena (in KiB) (=2GiB on 64-bit).
   mi_option_arena_is_numa_local,        // experimental: associate local numa node with an initial arena allocation
   mi_option_stats_merge_on_collect,     // on each theap collection, the theap stats are merged automatically with the parent heap
-  mi_option_profile_alloc_interval,     // number of allocated bytes between automatic snapshots of the heap profiler (internally, this value is in KiB; use `mi_option_get_size`) (=1GiB, disabled)
-  mi_option_profile_inuse_interval,     // number of in-use bytes grown between automatic snapshots of the heap profiler (internally, this value is in KiB; use `mi_option_get_size`) (=0, disabled)
+  mi_option_profile_alloc_interval,     // number of allocated bytes between automatic snapshots of the heap profiler (=1GiB)
+  mi_option_profile_inuse_interval,     // number of in-use bytes grown between automatic snapshots of the heap profiler (=0, disabled)
   mi_option_profile_time_interval,      // number of seconds between automatic snapshots of the  heap profiler (=0, disabled)
-  mi_option_profile_sample_rate,        // sample rate (in bytes) for heap profiler (internally, this value is in KiB; use `mi_option_get_size`) (=512 KiB)
-  mi_option_stats_merge_threshold,      // on a page stats update, merge theap stats into the parent heap if N bytes were freed/allocated (=0, disabled)
+  mi_option_profile_sample_rate,        // sample rate (in bytes) for heap profiler (=512 KiB)
+  mi_option_stats_merge_threshold,      // on a page stats update, merge theap stats into the parent heap if N bytes were freed/allocated; 0 disables (=4 MiB)
   mi_option_arena_purge_immediate_size, // ranges above this size are purged immediately
+  mi_option_mte,                        // use memory tagging (MTE) if available (and mimalloc is built with `MI_MTE=PREFER` or `ON`) (=1); on Linux, 2=sync, 3=async, 4=preferred tag check mode
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -546,8 +559,6 @@ mi_decl_export void mi_option_set_default(mi_option_t option, long value);
 // note: we use `mi_cfree` as "checked free" and it checks if the pointer is in our theap before free-ing.
 // -------------------------------------------------------------------------------------------------------
 
-mi_decl_export bool  mi_cfree(void* p) mi_attr_noexcept;
-mi_decl_export void* mi__expand(void* p, size_t newsize) mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export size_t mi_malloc_size(const void* p)        mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export size_t mi_malloc_good_size(size_t size)     mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export size_t mi_malloc_usable_size(const void *p) mi_attr_noexcept;
@@ -556,26 +567,30 @@ mi_decl_export int mi_posix_memalign(void** p, size_t alignment, size_t size); /
 mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_memalign(size_t alignment, size_t size) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(2) mi_attr_alloc_align(1);
 mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_valloc(size_t size)  mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(1);
 mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_pvalloc(size_t size) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(1);
-mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_aligned_alloc(size_t alignment, size_t size) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(2) mi_attr_alloc_align(1);
 
 mi_decl_nodiscard mi_decl_export void* mi_reallocarray(void* p, size_t count, size_t size) mi_attr_noexcept mi_attr_alloc_size2(2,3);
 mi_decl_nodiscard mi_decl_export int   mi_reallocarr(void* ptrp, size_t count, size_t size) mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export void* mi_aligned_recalloc(void* p, size_t newcount, size_t size, size_t alignment) mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export void* mi_aligned_offset_recalloc(void* p, size_t newcount, size_t size, size_t alignment, size_t offset) mi_attr_noexcept;
 
-mi_decl_export void mi_free_size_aligned(void* p, size_t size, size_t alignment) mi_attr_noexcept;
-mi_decl_export void mi_free_aligned(void* p, size_t alignment)                   mi_attr_noexcept;
-mi_decl_export int  mi_dupenv_s(char** buf, size_t* size, const char* name)      mi_attr_noexcept;
+// C11
+mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_aligned_alloc(size_t alignment, size_t size) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(2) mi_attr_alloc_align(1);
 
-// wide characters
-mi_decl_export int mi_wdupenv_s(wchar_t** buf, size_t* size, const wchar_t* name)       mi_attr_noexcept;
-mi_decl_nodiscard mi_decl_export mi_decl_restrict wchar_t* mi_wcsdup(const wchar_t* s)  mi_attr_noexcept mi_attr_malloc;
-mi_decl_nodiscard mi_decl_export mi_decl_restrict unsigned char* mi_mbsdup(const unsigned char* s)  mi_attr_noexcept mi_attr_malloc;
+// C23
+mi_decl_export void  mi_free_aligned_sized( void* p, size_t alignment, size_t size ) mi_attr_noexcept;
+mi_decl_export void  mi_free_sized( void* p, size_t size ) mi_attr_noexcept;
+
+// MSVC
+mi_decl_export void* mi__expand(void* p, size_t newsize) mi_attr_noexcept;
+mi_decl_export int   mi_dupenv_s(char** buf, size_t* size, const char* name) mi_attr_noexcept;
+mi_decl_export int   mi_wdupenv_s(wchar_t** buf, size_t* size, const wchar_t* name) mi_attr_noexcept;
+mi_decl_nodiscard mi_decl_export mi_decl_restrict wchar_t*       mi_wcsdup(const wchar_t* s) mi_attr_noexcept mi_attr_malloc;
+mi_decl_nodiscard mi_decl_export mi_decl_restrict unsigned char* mi_mbsdup(const unsigned char* s) mi_attr_noexcept mi_attr_malloc;
 
 // --------------------------------------------------------
 // C++ wrappers
-// The `mi_new` wrappers implement C++ semantics on out-of-memory 
-// instead of directly returning `NULL`. (and call `std::get_new_handler` 
+// The `mi_new` wrappers implement C++ semantics on out-of-memory
+// instead of directly returning `NULL`. (and call `std::get_new_handler`
 // and potentially raise a `std::bad_alloc` exception).
 // --------------------------------------------------------
 
@@ -597,9 +612,9 @@ mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_theap_alloc_new_nothr
 
 // --------------------------------------------------------------------------
 // Inlined constant size allocations.
-// These are meant for runtime systems, or overrides where we need the best 
+// These are meant for runtime systems, or overrides where we need the best
 // performance for small, constant-size allocations.
-// These are only better than the regular functions if the size or alignment 
+// These are only better than the regular functions if the size or alignment
 // are indeed constant at the call site.
 // --------------------------------------------------------------------------
 
@@ -619,7 +634,7 @@ static inline mi_decl_restrict void* mi_malloc_csize(size_t size) mi_attr_noexce
 static inline mi_decl_restrict void* mi_zalloc_csize(size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { return mi_wzalloc_small(mi_wsize_from_size(size)); } else { return mi_zalloc(size); }
 }
-static inline mi_decl_restrict void* mi_theap_malloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {  
+static inline mi_decl_restrict void* mi_theap_malloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
   assert(theap!=NULL);
   if (size <= MI_SMALL_SIZE_MAX) { return mi_theap_wmalloc_small(theap,mi_wsize_from_size(size)); } else { return mi_theap_malloc(theap,size); }
 }
@@ -684,8 +699,8 @@ template<class T> struct _mi_stl_allocator_common {
   using propagate_on_container_copy_assignment = std::true_type;
   using propagate_on_container_move_assignment = std::true_type;
   using propagate_on_container_swap            = std::true_type;
-  template <class U, class ...Args> void construct(U* p, Args&& ...args) { ::new(p) U(std::forward<Args>(args)...); }
-  template <class U> void destroy(U* p) mi_attr_noexcept { p->~U(); }
+  // no construct/destroy: std::allocator_traits provides them, and declaring them
+  // disables the memmove/memset/trivial-destroy fast paths of the STL containers
   #else
   void construct(pointer p, value_type const& val) { ::new(p) value_type(val); }
   void destroy(pointer p) { p->~value_type(); }

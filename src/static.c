@@ -8,12 +8,12 @@ terms of the MIT license. A copy of the license can be found in the file
 // --------------------------------------------------------------------------
 // This is a "single file include" of the entire mimalloc library.
 // Just include this file in your build to link statically with mimalloc.
-// This will also override the standard library allocation functions 
+// This will also override the standard library allocation functions
 // (if cmake -DMI_OVERRIDE=ON (or the macro MI_MALLOC_OVERRIDE=1 is defined)).
 //
-// This is also used for a static override where we create a single object 
-// file containing the whole library. 
-// If such object file is linked first it will override all the standard library 
+// This is also used for a static override where we create a single object
+// file containing the whole library.
+// If such object file is linked first it will override all the standard library
 // allocation functions (on Unix's).
 // --------------------------------------------------------------------------
 
@@ -36,16 +36,19 @@ terms of the MIT license. A copy of the license can be found in the file
 #endif
 
 #include "util/libc.c"
+#include "util/memid.c"
 #include "util/options.c"
 #include "util/random.c"
 #include "util/stats.c"
 #include "util/threadlocal.c"
 
-#include "arena/arena.c"           
-#include "arena/arena-alloc.c" 
+#include "arena/arena.c"
+#include "arena/arena-alloc.c"
 #include "arena/arena-page.c"
+#include "arena/arena-page-alloc.c"
+#include "arena/arena-heap.c"
 #include "arena/bitmap-chunk.c"
-#include "arena/bitmap.c"          
+#include "arena/bitmap.c"
 
 #include "alloc/alloc.c"           // includes alloc-override.c and free.c (for aliasing to work)
 #include "alloc/alloc-generic.c"
@@ -55,7 +58,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "alloc/page-queue.c"
 
 #include "heap/heap.c"
-#include "heap/init.c"
+#include "heap/process.c"
 #include "heap/page-map.c"
 #include "heap/subproc.c"
 #include "heap/theap.c"
@@ -63,3 +66,5 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "profile/sample-guarded.c"
 #include "profile/sample-profile.c"
 #include "profile/pprof.c"
+#include "profile/pprof-os.c"
+#include "profile/pprof-write.c"

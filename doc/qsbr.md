@@ -17,8 +17,7 @@ is not included here.
 ## Enabling the hooks
 
 Define `MI_QSBR=1` before including mimalloc headers and `src/static.c`.
-Defining `MI_CPYTHON` also enables it by default; other runtimes need not define
-`MI_CPYTHON`. Supply function definitions for the runtime primitives declared in
+Supply function definitions for the runtime primitives declared in
 `include/mimalloc/qsbr.h`, either in the same translation unit or linked from
 another host source file.
 Missing hooks deliberately fail to build rather than silently release pages.
@@ -80,7 +79,8 @@ The core gates heap initialization and delay decisions using
 `mi_heap_qsbr_is_enabled(heap)`. This is a mimalloc-owned inline query, not a
 runtime primitive: it reads the immutable
 flag when QSBR is compiled in and returns `false` otherwise. Protected theaps
-disable early full-page abandonment. The host needs no copy of that flag.
+retain singleton pages; ordinary pages follow `page_full_retain`.
+The host needs no copy of that flag.
 
 ## Primitive contract
 
@@ -148,8 +148,9 @@ A delayed owned page belongs to two independent lists:
 - Its ordinary mimalloc size-class queue, so it remains available for allocation.
 - Its theap's QSBR queue, so ready pages can be drained efficiently.
 
-Mimalloc owns `qsbr_next`, `qsbr_prev`, and `qsbr_in_queue` in each page and
-`qsbr_first`/`qsbr_last` in each theap. The membership bit distinguishes an
+Mimalloc owns `qsbr_next`, `qsbr_prev`, and `qsbr_xthread_id` in each page and
+`qsbr_first`/`qsbr_last` in each theap. The membership bit (the lowest bit of
+`qsbr_xthread_id`) distinguishes an
 unlinked page from a singleton queue without dereferencing an abandoned page's
 old theap. Only owned pages can be queued. A recorded goal alone does not imply
 queue membership: abandoned pages retain their goals after being unlinked.
@@ -195,6 +196,14 @@ considered by the adapter; these hooks alone do not make arbitrary reads after
 
 ## Abandoned pages and progress
 
+Protected singleton pages stay in their owner's huge queue instead of being
+abandoned when full, even when `page_full_retain` permits abandonment.
+Before each huge allocation, the owner drains its delayed QSBR queue and
+examines a bounded, rotating portion of the huge queue for remote frees.
+Empty pages are queued for delayed release until their grace period completes.
+Ordinary pages still follow `page_full_retain`, and thread exit or explicit
+theap abandonment still abandons singletons.
+
 V3 now permits an empty page to remain abandoned when its grace period is
 unfinished. Mimalloc unlinks it while its old theap is still valid.
 The page keeps its stable heap context and goal, but
@@ -202,7 +211,9 @@ The page keeps its stable heap context and goal, but
 dereference it.
 
 Ordinary empty arena pages remain in the existing per-heap abandoned size-class
-maps and can be reclaimed by allocation. Reclaim does not require waiting if
+maps and can be reclaimed by allocation. If a full regular arena page becomes
+empty while abandonment collects concurrent frees, delayed release re-abandons
+it as mapped before releasing ownership. Reclaim does not require waiting if
 the runtime permits compatible reuse. Empty arena singletons are **not** put in
 those maps; they remain in the all-pages map. OS pages stay in the existing
 abandoned OS-page list. No new shared delayed-page list is introduced.
@@ -210,13 +221,16 @@ abandoned OS-page list. No new shared delayed-page list is introduced.
 A page may also become empty only after its owner has terminated. A zero goal
 in this case is **not** evidence of safety: `mi_page_qsbr_should_delay` must
 establish a new grace period using the heap's stable domain. On a free-side
-release attempt, an unfinished empty page is reclaimed into the calling
-thread's theap for the same heap, creating that theap and initializing the
-thread if needed. Ordinary release then resets its retirement countdown and
-queues it for QSBR collection. This includes singleton and OS pages and
-bypasses nonempty-page reclaim limits. The runtime must ensure that QSBR
-allocations are not freed by late TLS destructors after mimalloc thread
-shutdown. Thread-exit abandonment is unchanged.
+release attempt, an unfinished empty page is reclaimed only if the calling
+thread already has its originating theap. Ordinary release then resets its
+retirement countdown and queues it for QSBR collection. This includes singleton
+and OS pages and bypasses nonempty-page reclaim limits.
+Otherwise the page remains abandoned with its goal intact; the free does not
+initialize a thread or create a theap. Ordinary arena pages are made available
+for allocation reclaim, while singletons and OS pages remain visible to the
+abandoned-page collector. The empty-page path finishes handling the page and
+releases ownership, without falling through to nonempty-page reclaim.
+Thread-exit abandonment is unchanged.
 
 A goal is a target QSBR sequence identifying the grace period that must finish
 before releasing the page. Zero means that no goal has been recorded, not that
@@ -230,12 +244,12 @@ lives in `_PyMem_mi_page_maybe_free`, not `_PyMem_mi_page_is_safe_to_free`.
 Cold abandoned pages need an explicit progress path. The internal
 `_mi_heap_collect_abandoned(heap)` helper scans the existing all-pages map
 and abandoned OS list, claims abandoned pages before collecting their frees,
-and releases only safe empty pages. The caller must first stop **all**
-allocation, freeing, heap/theap lifecycle operations, and other collectors
-that could access this heap. The allocator's heap lock alone does not provide
-this exclusion. This is intended for runtime-controlled quiescent collection,
-not concurrent background scanning. If readers have not finished, pages remain
-retained and a later sweep is required.
+and releases only safe empty pages. Frees may run concurrently: pages owned by
+a concurrent free are skipped, as that free collects the page itself. The caller
+must first stop all allocation, heap/theap lifecycle operations, and other
+collectors that could access this heap. The allocator's heap lock alone does not
+provide this exclusion. If readers have not finished, pages remain retained and
+a later sweep is required.
 
 ## Reclaim and heap lifetime
 
@@ -253,8 +267,9 @@ before creating heaps that need a particular mode.
 
 For heaps created by `mi_heap_new_qsbr()`, positive values are capped at `0`;
 negative values remain disabled. Thus a free can reclaim a nonempty protected
-page only into its originating theap. Empty pages delayed by QSBR use a
-same-heap theap, creating it if needed, regardless of this policy. This cap
+page only into its originating theap. Empty pages delayed by QSBR may also
+return to their existing originating theap regardless of this policy, but are
+never adopted into a foreign theap by a free. This cap
 does not change allocation-side reclaim: other theaps may still obtain
 compatible abandoned pages from the same heap when looking for a fresh page.
 
@@ -283,7 +298,13 @@ orphans awaiting terminal destruction.
 
 ## Fork handling
 
-Forking requires other threads to be outside mimalloc. A host that also performs
-uncoordinated fork-and-exec operations can define `MI_NO_PTHREAD_ATFORK=1` and
-call `_mi_fork_child()` explicitly after a coordinated fork, before resuming
-allocator use. Exec-only children must not use the allocator before exec.
+mimalloc registers a `pthread_atfork` child handler that only marks the threads
+that do not exist in the child; their pages are abandoned lazily when a new
+thread starts in the child (as it can reuse the thread id of a dead thread), or
+during the periodic administration on the generic allocation path.
+Uncoordinated fork-and-exec is therefore safe as long as the child does not use
+the allocator before exec. A child that keeps allocating
+requires that other threads were outside mimalloc at the fork (if such a thread
+held an allocator lock, its pages are leaked in the child). With
+`MI_NO_PTHREAD_ATFORK=1`, a host can call `_mi_fork_child()` itself after a
+coordinated fork, before resuming allocator use.

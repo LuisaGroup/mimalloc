@@ -7,6 +7,8 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include "mimalloc.h"
 #include "mimalloc/prim/os.h"
+#include "mimalloc/heap/subproc.h"
+#include "mimalloc/alloc/free.h"
 #if defined(MI_MALLOC_OVERRIDE)
 
 #if !defined(__APPLE__)
@@ -39,10 +41,31 @@ extern malloc_zone_t* malloc_default_purgeable_zone(void) __attribute__((weak_im
    malloc zone members
 ------------------------------------------------------ */
 
-static bool is_mimalloc_zone( malloc_zone_t* zone ); 
+static bool is_mimalloc_zone( malloc_zone_t* zone );
+
+#if MI_MTE
+// libmalloc requests canonical (tag 0) memory from an interposed zone through a thread option
+// (`MALLOC_ZONE_MALLOC_OPTION_CANONICAL_TAG`), used for example by the objc method caches.
+typedef struct mi_malloc_thread_options_s {
+  uintptr_t disable_expensive_debugging : 1;
+  uintptr_t disable_guard_malloc : 1;
+  uintptr_t disable_stack_logging : 1;
+  uintptr_t canonical_tag : 1;
+} mi_malloc_thread_options_t;
+extern mi_malloc_thread_options_t malloc_get_thread_options(void) __attribute__((weak_import));
+
+static void* zone_canonical(void* p) {
+  if (mi_memtag_is_enabled() && malloc_get_thread_options != NULL && malloc_get_thread_options().canonical_tag) {
+    return _mi_memtag_canonical(p);
+  }
+  return p;
+}
+#else
+#define zone_canonical(p)  (p)
+#endif
 
 static size_t zone_size(malloc_zone_t* zone, const void* p) {
-  if (mi_any_heap_contains(p)) { 
+  if (mi_any_heap_contains(p)) {
     return mi_usable_size(p);
   }
   else if (!is_mimalloc_zone(zone)) {  // can happen due to interpose
@@ -55,21 +78,21 @@ static size_t zone_size(malloc_zone_t* zone, const void* p) {
 
 static void* zone_malloc(malloc_zone_t* zone, size_t size) {
   MI_UNUSED(zone);
-  return mi_malloc(size);
+  return zone_canonical(mi_malloc(size));
 }
 
 static void* zone_calloc(malloc_zone_t* zone, size_t count, size_t size) {
   MI_UNUSED(zone);
-  return mi_calloc(count, size);
+  return zone_canonical(mi_calloc(count, size));
 }
 
 static void* zone_valloc(malloc_zone_t* zone, size_t size) {
   MI_UNUSED(zone);
-  return mi_malloc_aligned(size, _mi_os_page_size());
+  return zone_canonical(mi_malloc_aligned(size, _mi_os_page_size()));
 }
 
 static void zone_free(malloc_zone_t* zone, void* p) {
-  // during C++ thread shutdown `_pthread_tsd_cleanup` may call `zone_free` 
+  // during C++ thread shutdown `_pthread_tsd_cleanup` may call `zone_free`
   // after mimalloc mi_thread_done, and also on a pointer that was allocated in another subproc.
   if mi_unlikely(!mi_cfree(p)) {
     if (!is_mimalloc_zone(zone)) {  // can happen due to interpose
@@ -92,7 +115,7 @@ static void* zone_realloc(malloc_zone_t* zone, void* p, size_t newsize) {
 
 static void* zone_memalign(malloc_zone_t* zone, size_t alignment, size_t size) {
   MI_UNUSED(zone);
-  return mi_malloc_aligned(size,alignment);
+  return zone_canonical(mi_malloc_aligned(size,alignment));
 }
 
 static void zone_destroy(malloc_zone_t* zone) {
@@ -193,11 +216,12 @@ static boolean_t intro_zone_locked(malloc_zone_t* zone) {
 }
 
 // Required whenever the zone advertises version >= 9: macOS calls this from the
-// atfork_child handler (_malloc_fork_child) without a NULL check. mimalloc keeps
-// no zone-level locks that need reinitializing after fork, so a no-op is safe.
+// atfork_child handler (_malloc_fork_child) without a NULL check.
 // Leaving it NULL makes the forked child jump to address 0 and crash in fork().
+// This runs in the child before the other libSystem child handlers (that allocate).
 static void intro_reinit_lock(malloc_zone_t* zone) {
   MI_UNUSED(zone);
+  _mi_fork_child_zone();
 }
 
 
@@ -224,7 +248,7 @@ static malloc_introspection_t mi_introspect = {
 #if defined(MAC_OS_X_VERSION_10_6) && (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_6) && !defined(__ppc__)
   .statistics = &intro_statistics,
   .zone_locked = &intro_zone_locked,
-#endif  
+#endif
 #if defined(MAC_OS_X_VERSION_10_12) && (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_12) && !defined(__ppc__)
   .reinit_lock = &intro_reinit_lock,
 #endif
@@ -343,7 +367,8 @@ static void mi__malloc_fork_parent(void) {
   // nothing
 }
 static void mi__malloc_fork_child(void) {
-  // nothing
+  // we replace libSystem's `_malloc_fork_child` (which would call our zone `intro_reinit_lock`)
+  _mi_fork_child_zone();
 }
 
 static void mi_malloc_printf(const char* fmt, ...) {
@@ -383,7 +408,7 @@ static void zone_unregister(malloc_zone_t* zone) {
 // use interposing so `DYLD_INSERT_LIBRARIES` works without `DYLD_FORCE_FLAT_NAMESPACE=1`
 // See: <https://books.google.com/books?id=K8vUkpOXhN4C&pg=PA73>
 #define MI_INTERPOSE_ZONE(fun)          MI_INTERPOSE_FUN(malloc_##fun,fun)
-MI_INTERPOSE_DECLS(_mi_zone_interposes) = 
+MI_INTERPOSE_DECLS(_mi_zone_interposes) =
 {
   MI_INTERPOSE_MI(malloc_create_zone),
   MI_INTERPOSE_MI(malloc_default_purgeable_zone),

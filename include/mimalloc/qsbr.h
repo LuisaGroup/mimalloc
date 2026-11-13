@@ -7,9 +7,9 @@ terms of the MIT license. A copy of the license can be found in the file
 
 /* ----------------------------------------------------------------------------
   Quiescent State-Based Reclamation (qsbr).
-  QSBR as used in CPython is a technique for safe memory reclamation in concurrent 
+  QSBR as used in CPython is a technique for safe memory reclamation in concurrent
   environments. In such case we need to delay free-ing pages until there are no
-  more concurrent readers; the interface below provides the necessary primitives 
+  more concurrent readers; the interface below provides the necessary primitives
   for managing QSBR state so mimalloc can delay freeing pages until it is
   safe to do so (and efficiently reuse them as well).
 
@@ -24,15 +24,11 @@ terms of the MIT license. A copy of the license can be found in the file
 #include <stdbool.h>
 
 #ifndef MI_QSBR
-#if defined(MI_CPYTHON)
-#define MI_QSBR 1
-#else
-#define MI_QSBR 0
-#endif
+#define MI_QSBR   0
 #endif
 
 // Create a qsbr enabled heap
-mi_decl_nodiscard mi_decl_export mi_heap_t* mi_heap_new_qsbr(void); 
+mi_decl_externc mi_decl_nodiscard mi_decl_export mi_heap_t* mi_heap_new_qsbr(void);
 
 #if MI_QSBR
 // Define these for the host runtime to implement qsbr bookkeeping.
