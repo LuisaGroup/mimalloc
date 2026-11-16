@@ -571,7 +571,7 @@ With `-DMI_SECURE_ENV=ON`, only `MIMALLOC_SHOW_STATS`, `MIMALLOC_VERBOSE`, and
 
 This is by default enabled for [secure mode](#secure-mode), [MTE](#memory-tagging-mte),
 and [PAC](#pointer-authentication-pac). This can be overridden by explicitly building
-with `-DMI_SECURE_ENV=OFF`. Note: even with `OFF`, an elevated process ignores
+with `-DMI_SECURE_ENV=OFF`. Note: even with `OFF`, an elevated process always ignores
 all environment options. Moreover, a program build with secure mode always ignores
 settings for large- or huge OS pages (as pinned memory cannot be guarded).
 You can still set options programmatically for trusted programs.
@@ -591,14 +591,14 @@ With `MINIMAL` only security mitigations are added that have minimal impact on p
   (if possible), and mimalloc aborts on corrupted meta data detection.
 - Large blocks (> 512 KiB) are followed by a guard page.
 - Does not allocate or reserve large OS pages as pinned memory cannot hold a guard page.
-- Enables `MI_SECURE_ENV`
+- Enables `MI_SECURE_ENV=ON`
 
 With `CHECKED` (the default with `-DMI_MTE` and `-DMI_PAC`), the performance and memory impact
 is still relatively small (usually less than 10%, but can be 2x slower):
 
 - All free list pointers are
   [encoded](include/mimalloc/alloc/page.h#L582)
-  with per-page keys which is used both to prevent overwrites with a known pointer, as well as to detect heap corruption (and with [PAC](#pointer-authentication-pac),
+  with per-page keys which is used to prevent overwrites with a known pointer, as well as to detect heap corruption (and with [PAC](#pointer-authentication-pac),
   the encoding uses hardware keys).
 - All pointers passed to `mi_free` (and others) are validated, and pointers not originating from a mimalloc allocation
   are ignored. Interior pointers are adjusted to the start of their block.
@@ -635,17 +635,20 @@ tag. Adjacent blocks (almost) always get different tags (and linear block overfl
 its neighbours). All blocks up to 512KiB are tagged, but larger blocks get a guard page
 at the end so overflows still fault (this is done as tagging memory is linear in the size of the block).
 
-It depends on the hardware and workload,
-but on an M5 an MTE build is usually within about 15% of a release build (but can be 2 to 3x slower).
-When building with `-DMI_MTE=ON`, _mimalloc_ requires that the CPU and OS support MTE at runtime and
-otherwise aborts at initialization (and, on Linux, if tag checking cannot be enabled for all threads).
-You can also build with `-DMI_MTE=PREFER` which uses MTE when both the hardware and OS support it, and
-otherwise runs untagged. An MTE build running untagged is very close in performance to a regular release build.
-Every MTE build gets the `-mte` suffixed to the library name (e.g. `mimalloc-mte.o`).
+It depends on the hardware and workload, but on an M5 an MTE build is usually within about 20% of a release
+build (but can be 2 to 3x slower).
+Building with `-DMI_MTE=ON` also sets pointer authentication ([PAC](#pointer-authentication-pac)) (`-DMI_PAC=ON`),
+`-DMI_SECURE=CHECKED`, and `MI_SECURE_ENV=ON` by default.
 
-Building with MTE also enables `-DMI_SECURE=CHECKED` (and `-DMI_SECURE_ENV=ON`) by default (including encoded free lists).
-Since MTE catches (most) use-after-free, double-free, and heap block overflows, an MTE build gives
-similar and often stronger guarantees as `-DMI_SECURE=ON` (and there is no need to use them together).
+__These combined options provide strong mitigation against common heap exploitation techniques__.\
+As it is hardware assisted, this is stronger than `-DMI_SECURE=ON`.
+
+When building with `-DMI_MTE=ON`, _mimalloc_ requires that the CPU and OS support MTE at runtime and
+otherwise aborts at initialization.
+You can also build with `-DMI_MTE=PREFER` which uses MTE when both the hardware and OS support it, and
+otherwise runs untagged (which is very close in performance to a regular release build).
+A `-DMI_MTE=ON` build gets the `-mte-pac` suffix in the library name (e.g. `mimalloc-mte-pac.o`)
+(or just `-mte` with `-DMI_PAC=OFF`).
 
 - __macOS__: requires an Apple M5 (or later) with macOS 26+. MTE is only enabled for executables signed with
   the hardened-process entitlements (the mimalloc tests are signed automatically):
@@ -656,10 +659,6 @@ similar and often stronger guarantees as `-DMI_SECURE=ON` (and there is no need 
 - __Linux__: requires an arm64 kernel with MTE support (check with `grep mte /proc/cpuinfo`). The tag check mode
   can be set with `MIMALLOC_MTE=sync` (default), `async`, or `preferred`. Without MTE hardware you can still
   test using QEMU emulation (e.g. `QEMU_CPU=max qemu-aarch64 ./myprogram`).
-  On Linux, tag checking is enabled per thread and inherited by threads created afterwards; _mimalloc_ should therefore be
-  initialized before other threads are created (which is the case when it is dynamically linked or preloaded). Otherwise
-  it is a fatal error (or a warning with `-DMI_MTE=PREFER`) as those threads may not use tag checking (until they allocate),
-  and system calls with tagged pointers may fail in threads that never call _mimalloc_.
 - __Android__: requires an MTE capable device (like the Pixel 8 or later) with MTE enabled in
   _Developer options_ / _Memory Tagging Extension_. Build with the Android NDK as:
   ```
@@ -673,7 +672,7 @@ similar and often stronger guarantees as `-DMI_SECURE=ON` (and there is no need 
   > cmake -DMI_MTE=ON -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
           -DMI_BUILD_SHARED=OFF -DMI_BUILD_OBJECT=OFF -DMI_BUILD_TESTS=OFF ../..
   ```
-  and link `libmimalloc-mte.a` into the app.
+  and link `libmimalloc-mte-pac.a` into the app.
 
 [MTE]: https://support.arm.com/documentation/108035/0100/How-does-MTE-work-
 
@@ -685,16 +684,15 @@ On recent arm64 hardware with _pointer authentication_ ([PAC]), _mimalloc_ can b
 The PAC extension provides secret hardware keys that _mimalloc_ uses to sign root pointers. On access these
 are validated and prevent tampering. On an M5, the overhead is usually ~10% but can be 1 to 2x slower.
 
-_This is most effective together with MTE, and the combined options_ `-DMI_MTE=ON -DMI_PAC=ON`
-_provide strong mitigation against common heap explotation techniques_.
-The performance combined is usually within 5% of just MTE.
+This is most effective together with MTE (and it is enabled by default with `-DMI_MTE=ON`); and without
+MTE it is best to use `-DMI_SECURE=ON` to get the most benefit.
 The following are signed:
 - The free list links, such that a heap block overflow or use-after-free write cannot forge a free list pointer
   (even when the per-page keys are known).
 - The page map entries, the thread local theap pointers, and other root pointers that might reside
   adjacent to user memory.
 
-Any authentication failure aborts the program. Building with PAC also enables `-DMI_SECURE=CHECKED` (and `-DMI_SECURE_ENV=ON`)  by default (just like MTE).
+Any authentication failure aborts the program. Building with PAC also enables `-DMI_SECURE=CHECKED` (and `-DMI_SECURE_ENV=ON`) by default (just like MTE).
 When building with `-DMI_PAC=ON`, _mimalloc_ requires that the CPU and OS support PAC and aborts at initialization otherwise.
 On other platforms (or with MSVC) you can build with `-DMI_PAC=WEAK` instead, which signs the same pointers using a
 random process key in software. This is weaker (an attacker who can read memory may recover the key) but still
@@ -710,7 +708,7 @@ PAC is part of Armv8.3-A and later, and is supported, for example, by:
 
 <!--
 **Note:**
-MTE+PAC provide strong hardware security mitigation -- common heap explotation techniques, like linear overflow
+MTE+PAC provide strong hardware security mitigation -- common heap exploitation techniques, like linear overflow
 into a neighbour or metadata, use-after-free, double free, free-list poisoning, forging a page-map or theap pointer,
 usually fault. In the end though, tag checks are still probabilistic and cannot prevent all attacks.
 If you are in security research, it would be nice

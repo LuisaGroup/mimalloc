@@ -73,16 +73,20 @@ static inline size_t mi_page_info_size(void) {
   return mi_align_up(sizeof(mi_page_t), MI_MAX_ALIGN_SIZE);
 }
 
-// Can the first block in a page with blocks of size `bsize` have a cache offset? (see `MI_PAGE_CACHE_OFFSET`)
-static inline bool mi_block_size_has_cache_offset(size_t bsize) {
-  return (MI_PAGE_CACHE_OFFSET != 0 && bsize > MI_SMALL_MAX_OBJ_SIZE);
+// Can the first block in a page with blocks of size `bsize` have a large cache offset? (see `MI_PAGE_LARGE_CACHE_OFFSET`; smaller blocks use a small cache offset)
+static inline bool mi_block_size_has_large_cache_offset(size_t bsize) {
+  #if MI_PAGE_LARGE_CACHE_OFFSET
+  return (bsize > MI_SMALL_MAX_OBJ_SIZE);
+  #else
+  return false;
+  #endif
 }
 
 // Is a (non-small) block of size `bsize` allocated in a medium page?
 // Blocks of 1/8th of a medium page (64 KiB) leave no space for a cache offset and use a large page instead.
 static inline bool mi_block_size_is_medium(size_t bsize) {
   #if MI_ENABLE_LARGE_PAGES
-  if (mi_block_size_has_cache_offset(bsize) && bsize == MI_MEDIUM_PAGE_SIZE/8) return false;
+  if (mi_block_size_has_large_cache_offset(bsize) && bsize == MI_MEDIUM_PAGE_SIZE/8) return false;
   #endif
   return (bsize <= MI_MEDIUM_MAX_OBJ_SIZE);
 }
@@ -92,10 +96,10 @@ static inline bool mi_block_size_is_medium(size_t bsize) {
 // and used by `mi_malloc_aligned` to avoid over-allocation for naturally aligned blocks.
 static inline size_t mi_natural_alignment_of_size(size_t bsize) {
   const size_t lowbit = bsize & (~bsize + 1);  // largest power of 2 that divides `bsize`
-  if (mi_is_power_of_two(bsize) && bsize <= MI_PAGE_MAX_START_BLOCK_ALIGN2) return bsize;   // power-of-two blocks up to 4KiB
   if (bsize <= MI_SMALL_SIZE_MAX) return lowbit;                                            // small blocks start at a multiple of their size
+  if (mi_is_power_of_two(bsize) && bsize <= MI_PAGE_MAX_START_BLOCK_ALIGN2) return bsize;   // power-of-two blocks up to 4KiB
   if ((bsize % MI_PAGE_OSPAGE_BLOCK_ALIGN2) == 0) {                                         // multiples of 4KiB are 4KiB aligned (or cache offset unit aligned)
-    return (mi_block_size_has_cache_offset(bsize) ? MI_PAGE_CACHE_OFFSET_UNIT : MI_PAGE_OSPAGE_BLOCK_ALIGN2);
+    return (mi_block_size_has_large_cache_offset(bsize) ? MI_PAGE_LARGE_CACHE_OFFSET_UNIT : MI_PAGE_OSPAGE_BLOCK_ALIGN2);
   }
   return (lowbit < MI_MAX_ALIGN_SIZE ? lowbit : MI_MAX_ALIGN_SIZE);                         // otherwise blocks start at least `MI_MAX_ALIGN_SIZE` aligned
 }
@@ -553,13 +557,13 @@ static inline void mi_page_qsbr_unlink(mi_page_t* page) {
   mi_theap_t* theap = mi_page_theap(page);
   if (page->qsbr_prev != NULL) { page->qsbr_prev->qsbr_next = page->qsbr_next; }
   else {
-    mi_assert_internal(theap->qsbr_first == page);
-    theap->qsbr_first = page->qsbr_next;
+    mi_assert_internal(theap->qsbr_delayed == page);
+    theap->qsbr_delayed = page->qsbr_next;
   }
   if (page->qsbr_next != NULL) { page->qsbr_next->qsbr_prev = page->qsbr_prev; }
   else {
-    mi_assert_internal(theap->qsbr_last == page);
-    theap->qsbr_last = page->qsbr_prev;
+    mi_assert_internal(theap->qsbr_delayed_last == page);
+    theap->qsbr_delayed_last = page->qsbr_prev;
   }
   page->qsbr_next = page->qsbr_prev = NULL;
   mi_page_qsbr_set_in_queue(page, false);
@@ -576,10 +580,10 @@ static inline void mi_page_qsbr_enqueue(mi_page_t* page, mi_theap_t* theap) {
   mi_assert_internal(!mi_page_qsbr_is_clear(&page->qsbr));
   if (mi_page_qsbr_is_in_queue(page)) return;
   mi_assert_internal(page->qsbr_next == NULL && page->qsbr_prev == NULL);
-  page->qsbr_prev = theap->qsbr_last;
-  if (theap->qsbr_last != NULL) { theap->qsbr_last->qsbr_next = page; }
-  else { theap->qsbr_first = page; }
-  theap->qsbr_last = page;
+  page->qsbr_prev = theap->qsbr_delayed_last;
+  if (theap->qsbr_delayed_last != NULL) { theap->qsbr_delayed_last->qsbr_next = page; }
+  else { theap->qsbr_delayed = page; }
+  theap->qsbr_delayed_last = page;
   mi_page_qsbr_set_in_queue(page, true);
 #else
   MI_UNUSED(page);
@@ -832,5 +836,30 @@ static inline void mi_block_set_next(const mi_page_t* page, mi_block_t* block, c
   block->next = mi_block_encode(page, block, next);
   mi_track_mem_noaccess(block,sizeof(mi_block_t));
 }
+
+
+/* -----------------------------------------------------------
+  Safe unlinking of doubly linked lists
+
+  In secure mode, check that a `node` is properly linked through its `prev` and `next`
+  fields before unlinking it, such that corrupted links cannot be used for arbitrary writes.
+  `first` is the head of the list, and `last` the tail (or `NULL` if the list has no tail).
+  A corrupted list is a fatal error.
+----------------------------------------------------------- */
+
+static inline bool mi_list_link_is(const void* link, const void* node) {
+  return (mi_addr(link) == mi_addr(node));  // ignore memory tags
+}
+
+#if MI_SECURE>=1
+#define mi_list_unlink_check(node,prev,next,first,last) \
+  do { \
+    if mi_unlikely(!((node)->prev==NULL ? mi_list_link_is(first,node) : mi_list_link_is((node)->prev->next,node)) || \
+                   !((node)->next==NULL ? ((last)==NULL || mi_list_link_is(last,node)) : mi_list_link_is((node)->next->prev,node))) \
+    { _mi_error_list_corrupted(node); } \
+  } while(0)
+#else
+#define mi_list_unlink_check(node,prev,next,first,last)  do { } while(0)
+#endif
 
 #endif
